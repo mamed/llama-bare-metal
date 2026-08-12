@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Hermes agent state
+.remember/
+
+# Test artifacts
+.pytest_cache/
+*.egg-info/
+
+# Backups
+*.bak
+*.bak.*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env (commit a .env.example, never real secrets)
+.env
+.env.local
+
+# Logs
+*.log

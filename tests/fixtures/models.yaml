@@ -1,0 +1,25 @@
+models:
+  - name: text-only-tiny
+    model: /models/prism-ml/Bonsai-1.7B-gguf/Bonsai-1.7B-Q1_0.gguf
+    gpu_layers: 99
+    context_size: 32768
+    threads: 16
+    parallel: 1
+    cont_batching: true
+    flash_attention: true
+    agent: true
+
+  - name: vl-with-mmproj
+    model: /models/unsloth/gemma-4-26B-A4B-it-UD-IQ2_XXS/gemma-4-26B-it-UD-IQ2_XXS.gguf
+    mmproj: /models/unsloth/gemma-4-26B-A4B-it-UD-IQ2_XXS/mmproj-Q5_K_M.gguf
+    gpu_layers: 99
+    context_size: 98304
+    reasoning: true
+    reasoning_budget: 0
+    jinja: true
+
+  - name: with-extras
+    model: /models/foo/bar.gguf
+    override_tensor: "blk\\.0\\.ffn=CPU"
+    extra_args: ["--no-mmap", "--special"]
+    reasoning: "auto"

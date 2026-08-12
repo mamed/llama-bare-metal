@@ -1,0 +1,36 @@
+[Unit]
+Description=llama.cpp backend (one model at a time, MODEL from /home/fekry/llama-bare-metal/.env)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/fekry/llama-bare-metal
+Environment=CONFIG_FILE=/home/fekry/llama-cpp-docker/llama-unified/models.yaml
+Environment=MODELS_DIR=/home/fekry/llama-models/LLM-Models
+# Pin to the 3D V-Cache CCD (cores 0-7 = 96 MB L3 vs cores 8-15 = 32 MB L3).
+# KV cache streaming benefits from lower L3 latency.
+ExecStartPre=/bin/mkdir -p /tmp/llama-slots
+ExecStart=/usr/bin/taskset -c 0-7 /home/fekry/llama-bare-metal/llama-backend.sh
+ExecStop=/bin/rm -f %t/llama-backend.model
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# NVIDIA — make GPU visible. Same shape the Docker container used.
+Environment=NVIDIA_VISIBLE_DEVICES=all
+Environment=NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# CUDA memory tuning (CUDA 13.x). LAZY loading defers CUDA module loads
+# until first use, slightly reducing init-time VRAM peaks and init latency.
+Environment=CUDA_MODULE_LOADING=LAZY
+# Reduce CUDA driver memory caching (default keeps ~50MB cached for
+# faster re-init; we restart rarely so the saving is worth it).
+Environment=CUDA_CACHE_DISABLE=0
+
+# Reasonable OOM policy: a runaway model load should not take the host down
+OOMPolicy=stop
+OOMScoreAdjust=-100
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 10s
+  scrape_timeout: 8s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+scrape_configs:
+  - job_name: 'llama_backend'
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['192.168.70.93:64000']
+        labels:
+          instance: 'llama-backend'
+
+  - job_name: 'prometheus_self'
+    static_configs:
+      - targets: ['localhost:9090']

@@ -1,0 +1,79 @@
+# Prometheus alerting rules for llama.cpp backend.
+# Loaded via `rule_files:` in prometheus.yml.
+#
+# Available llama-server metrics (no VRAM/uptime/process metrics exposed):
+#   llamacpp:prompt_tokens_total              (counter)
+#   llamacpp:prompt_seconds_total             (counter)
+#   llamacpp:tokens_predicted_total           (counter)
+#   llamacpp:tokens_predicted_seconds_total   (counter)
+#   llamacpp:n_decode_total                   (counter)
+#   llamacpp:requests_processing              (gauge)
+#   llamacpp:n_busy_slots_per_decode          (gauge)
+#   llamacpp:n_tokens_max                     (gauge)
+#   llamacpp:spec_decode_*                    (counters)
+#
+# For VRAM, use node_exporter or NVIDIA dcgm-exporter on :9400.
+
+groups:
+  - name: llama_backend_alerts
+    interval: 30s
+    rules:
+      # Service down — Prometheus can't scrape llama-server
+      - alert: LlamaBackendDown
+        expr: up{job="llama_backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "llama-server on :64000 unreachable"
+          description: "Prometheus has not been able to scrape llama-server for 1 minute. Restart: systemctl --user restart llama-backend.service"
+
+      # Process restarted — request counter reset to 0 (use absent-after-present)
+      - alert: LlamaBackendProcessRestarted
+        expr: |
+          (rate(llamacpp:prompt_tokens_total[5m]) == 0)
+          and
+          (rate(llamacpp:prompt_tokens_total[15m]) > 0)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-backend process likely restarted"
+          description: "Request rate dropped to 0 from a previous positive value over the last 15 min window. Check journalctl --user -u llama-backend.service for crash logs."
+
+      # Decode latency regression
+      - alert: LlamaBackendSlowDecode
+        expr: rate(llamacpp:tokens_predicted_seconds_total[5m]) < 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Decode throughput below 30 tok/s"
+          description: "5-min average decode: {{ $value | printf \"%.1f\" }} tok/s. Healthy range is 80-110 tok/s on the 26B IQ2_M. Check for thermal throttling, runaway processes, or contention."
+
+      # All request slots busy
+      - alert: LlamaBackendAllSlotsBusy
+        expr: llamacpp:n_busy_slots_per_decode > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "All request slots consistently busy"
+          description: "n_busy_slots_per_decode = {{ $value | printf \"%.2f\" }} — every decode is processing a request. Consider adding parallel slots (if VRAM allows) or scaling up."
+
+      # Speculative decoding acceptance rate (where there are drafts)
+      - alert: LlamaBackendSpecAcceptanceLow
+        expr: |
+          (
+            rate(llamacpp:spec_decode_num_accepted_tokens_total[5m])
+            /
+            rate(llamacpp:spec_decode_num_draft_tokens_total[5m])
+          ) < 0.3
+          and
+          rate(llamacpp:spec_decode_num_draft_tokens_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Speculative decoding acceptance below 30%"
+          description: "ngram-cache acceptance rate is {{ $value | humanizePercentage }}. Spec engine is doing more verification than drafting. Could indicate unusual workload. Not necessarily a problem if throughput is still good."

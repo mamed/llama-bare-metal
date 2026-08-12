@@ -2,6 +2,9 @@
 Description=llama.cpp backend (one model at a time, MODEL from /home/fekry/llama-bare-metal/.env)
 After=network-online.target
 Wants=network-online.target
+# E4: Rate-limit restart attempts (must be in [Unit], not [Service]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -15,16 +18,13 @@ ExecStart=/usr/bin/taskset -c 0-7 /home/fekry/Projects/llama-bare-metal/llama-ba
 ExecStop=/bin/rm -f %t/llama-backend.model
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=300
 # E2: Watchdog — if llama-server hasn't sent a watchdog keepalive within
 # 300 seconds, systemd SIGKILLs the unit. llama-server doesn't natively
 # ping the watchdog, so this is a backstop for catastrophic hangs.
 # Set WATCHDOG_USEC=1 in the environment to enable.
-WatchdogTimeoutSec=300
-# E4: Rate-limit restart attempts — max 5 restarts in any 5-minute window.
-# After exhausting, `systemctl status` shows "failed" not "auto-restart".
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# (Correct directive: WatchdogSec= in [Service])
+WatchdogSec=300
 
 # NVIDIA — make GPU visible. Same shape the Docker container used.
 Environment=NVIDIA_VISIBLE_DEVICES=all

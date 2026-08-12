@@ -2,6 +2,9 @@
 Description=llama-router (OpenAI-compatible multiplexer on :64010)
 After=llama-backend.service
 Wants=llama-backend.service
+# E4: Rate-limit restart attempts (must be in [Unit], not [Service]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,9 +15,6 @@ Environment=BACKEND_SERVICE=llama-backend.service
 ExecStart=/usr/bin/python3 /home/fekry/Projects/llama-bare-metal/llama-router.py
 Restart=on-failure
 RestartSec=5
-# E4: Rate-limit restart attempts on the router too.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Install]
 WantedBy=default.target

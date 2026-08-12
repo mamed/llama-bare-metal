@@ -78,7 +78,7 @@ def build_args(
     # Disable per-launch via env var.
     import os as _os
     if _os.environ.get("DISABLE_REASONING") != "true":
-        args.extend(["--reasoning", "on", "--reasoning-budget", "16384"])
+        args.extend(["--reasoning", "on", "--reasoning-budget", "32768"])
     if _os.environ.get("DISABLE_AGENT") != "true":
         args.append("--agent")
     if _os.environ.get("DISABLE_JINJA") != "true":

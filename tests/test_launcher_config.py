@@ -256,7 +256,7 @@ def test_function_extra_args_appended(monkeypatch, tmp_path):
 # ---- Server-level defaults (apply to every model) ----
 
 def test_server_level_reasoning_default(monkeypatch, tmp_path):
-    """Default: --reasoning on --reasoning-budget 16384 present in args (at end of server defaults)."""
+    """Default: --reasoning on --reasoning-budget 32768 present in args (at end of server defaults)."""
     make_model(monkeypatch, tmp_path)
     yaml = make_yaml(tmp_path, 'models:\n- name: x\n  model: model.gguf\n')
     args = build_args(yaml, 'x')
@@ -265,7 +265,7 @@ def test_server_level_reasoning_default(monkeypatch, tmp_path):
     assert '--reasoning-budget' in args
     # They appear together (last 4 items unless extra_args added)
     reasoning_idx = args.index('--reasoning')
-    assert args[reasoning_idx:reasoning_idx + 4] == ['--reasoning', 'on', '--reasoning-budget', '16384']
+    assert args[reasoning_idx:reasoning_idx + 4] == ['--reasoning', 'on', '--reasoning-budget', '32768']
 
 
 def test_server_level_agent_default(monkeypatch, tmp_path):

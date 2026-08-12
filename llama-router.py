@@ -43,6 +43,7 @@ import signal
 import yaml
 import logging
 import logging.handlers
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib import request, error
@@ -452,8 +453,12 @@ def restart_with_model(model_name):
 def ensure_model_loaded(model_name):
     """If a different model is loaded, restart llama-backend with the requested one.
     L-3: If a recent swap failed, the module is in backoff — reject the request
-    with 503 + retry_after rather than hammering a broken backend."""
-    global current_model
+    with 503 + retry_after rather than hammering a broken backend.
+    O/F2: If another swap is already in progress, raise SwapInProgressError
+    so the proxy can return 503 + Retry-After instead of blocking on
+    restart_lock (which would either cut an in-flight stream or queue
+    behind another swap)."""
+    global current_model, _swap_in_progress
     # L-3: Backoff gate. Checked BEFORE acquiring restart_lock so a request
     # rejected by backoff doesn't block other swappers behind it.
     with _swap_backoff_lock:
@@ -464,14 +469,29 @@ def ensure_model_loaded(model_name):
             model_name, wait,
         )
         return False, ("in_backoff", wait)
-    with restart_lock:
-        loaded = read_current_model_from_backend()
-        if loaded == model_name:
-            return True, ("already_loaded", 0.0)
-        logger.info("loaded=%r requested=%r, restarting...", loaded, model_name)
-        restart_with_model(model_name)
-        current_model = model_name
-        return True, ("swapped", 0.0)
+    # O/F2: Quick check — if a swap is already in progress, bail out
+    # immediately rather than queuing behind it (the queued request would
+    # land on whatever model the in-flight swap just installed, not what
+    # the caller asked for, AND waiting on restart_lock blocks other
+    # handlers behind us on the same ThreadingHTTPServer worker).
+    with _swap_in_progress_lock:
+        if _swap_in_progress:
+            raise SwapInProgressError(
+                f"another swap is in progress; cannot swap to {model_name!r}"
+            )
+        _swap_in_progress = True
+    try:
+        with restart_lock:
+            loaded = read_current_model_from_backend()
+            if loaded == model_name:
+                return True, ("already_loaded", 0.0)
+            logger.info("loaded=%r requested=%r, restarting...", loaded, model_name)
+            restart_with_model(model_name)
+            current_model = model_name
+            return True, ("swapped", 0.0)
+    finally:
+        with _swap_in_progress_lock:
+            _swap_in_progress = False
 
 
 def extract_bearer_token(headers) -> Optional[str]:
@@ -519,6 +539,22 @@ def sanitize_forward_headers(client_headers) -> dict:
 # Lock so only one restart happens at a time
 restart_lock = threading.Lock()
 current_model = None
+
+
+# ---- O/F2: Prevent concurrent swaps ----
+# Two concurrent requests for different models used to both call
+# restart_with_model — the second restart cut the first request's stream
+# mid-flight, producing IncompleteRead → HTTP 500 with a leaked traceback.
+# The swap-in-progress flag makes the second caller bail out immediately
+# with a SwapInProgressError (handled in _proxy as 503 + Retry-After) so
+# the in-flight request gets a clean retry on the new model.
+class SwapInProgressError(RuntimeError):
+    """Raised when ensure_model_loaded is asked to swap while another swap
+    is already in progress. _proxy turns this into 503 + Retry-After."""
+
+
+_swap_in_progress = False
+_swap_in_progress_lock = threading.Lock()
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -670,6 +706,21 @@ class RouterHandler(BaseHTTPRequestHandler):
                     })
                     self._record_request_metric(endpoint_label, 503)
                     return
+            except SwapInProgressError as e:
+                # O/F2: Another swap is already in progress. Returning 503 +
+                # Retry-After lets the client retry on the new model without
+                # us blocking on restart_lock (which would either cut an
+                # in-flight stream mid-flight or starve other handlers).
+                logger.info(
+                    "request_id=%s swap-in-progress; deferring to next request: %s",
+                    request_id, e,
+                )
+                self._record_request_metric(endpoint_label, 503)
+                self._send_json(503, {
+                    "error": "another model swap is in progress",
+                    "request_id": request_id,
+                }, extra_headers={"Retry-After": "5"})
+                return
             except Exception as e:
                 # A4: Log full error server-side, return sanitized message to client.
                 self._handle_internal_error("failed to load model", e, request_id=request_id)
@@ -737,6 +788,30 @@ class RouterHandler(BaseHTTPRequestHandler):
                 client_payload = json.loads(err_body) if err_body else None
                 sanitized = {"error": "upstream error", "request_id": request_id}
                 self._send_json(e.code, sanitized)
+                return
+            except (http.client.IncompleteRead, ConnectionResetError, BrokenPipeError) as e:
+                # O/F1: The backend cut the stream mid-response — almost
+                # always because a model swap restarted llama-backend while
+                # we were reading from it. Returning 500 here leaks the
+                # traceback (A4 violation) AND tells the client nothing
+                # useful. 503 + Retry-After is the right signal: backend
+                # was reloaded mid-flight, please retry on the new model.
+                logger.warning(
+                    "request_id=%s backend cut stream mid-response: %s: %s",
+                    request_id, type(e).__name__, e,
+                )
+                self._record_request_metric(endpoint_label, 503)
+                sanitized = {
+                    "error": "backend stream interrupted (likely model swap)",
+                    "request_id": request_id,
+                }
+                try:
+                    self._send_json(503, sanitized, extra_headers={"Retry-After": "5"})
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client gave up between the time we caught the
+                    # backend error and the time we tried to write the
+                    # response — nothing useful we can do.
+                    pass
                 return
             except Exception as e:
                 # A4: Same treatment for any other proxy failure.
@@ -827,11 +902,18 @@ class RouterHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _send_json(self, code, data):
+    def _send_json(self, code, data, extra_headers=None):
+        """Write a JSON response. extra_headers is an optional dict of
+        additional response headers (e.g. {"Retry-After": "5"})."""
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # Phase O: Inject Retry-After (or any other header) BEFORE
+        # end_headers(). Must come after send_response or HTTP is malformed.
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         # L-4: Catch client-disconnect so a closed socket doesn't crash
         # the request handler. The `finally` in _proxy still runs and

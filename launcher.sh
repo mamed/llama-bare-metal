@@ -25,8 +25,8 @@ for _envd in /etc/profile.d/*.sh; do
 done
 unset _envd
 
-CONFIG="${CONFIG_FILE:-/home/fekry/llama-cpp-docker/llama-unified/models.yaml}"
-LLAMA_BARE_SRC="${LLAMA_BARE_SRC:-/home/fekry/llama-bare-metal/src}"
+CONFIG="${CONFIG_FILE:-/home/fekry/Projects/llama-cpp-unified/models.yaml}"
+LLAMA_BARE_SRC="${LLAMA_BARE_SRC:-/home/fekry/Projects/llama-bare-metal/src}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/home/fekry/bin/llama-server-bare/llama-server}"
 
 if [[ ! -f "$CONFIG" ]]; then

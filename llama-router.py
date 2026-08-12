@@ -50,10 +50,10 @@ from llama_bare.router_state import (
 
 CUDA_SERVE_URL = os.environ.get("CUDA_SERVE_URL", "http://127.0.0.1:64000")
 CUDA_SERVE_HEALTH = os.environ.get("CUDA_SERVE_HEALTH", "http://127.0.0.1:64000/health")
-ENV_DIR = os.environ.get("ENV_DIR", "/home/fekry/llama-bare-metal")
+ENV_DIR = os.environ.get("ENV_DIR", "/home/fekry/Projects/llama-bare-metal")
 ENV_FILE = os.environ.get("ENV_FILE", f"{ENV_DIR}/.env")
 MODELS_YAML = os.environ.get(
-    "MODELS_YAML", "/home/fekry/llama-cpp-docker/llama-unified/models.yaml"
+    "MODELS_YAML", "/home/fekry/Projects/llama-cpp-unified/models.yaml"
 )
 BACKEND_STATE_FILE = os.environ.get(
     "BACKEND_STATE_FILE", os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000") + "/llama-backend.model"

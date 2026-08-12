@@ -7,7 +7,7 @@
 # - Removes $STATE_FILE on exit (any signal)
 set -euo pipefail
 
-ENV_FILE="${ENV_FILE:-/home/fekry/llama-bare-metal/.env}"
+ENV_FILE="${ENV_FILE:-/home/fekry/Projects/llama-bare-metal/.env}"
 STATE_FILE="${STATE_FILE:-${XDG_RUNTIME_DIR:-/run/user/$UID}/llama-backend.model}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -37,4 +37,4 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Hand off to the actual launcher
-exec /home/fekry/llama-bare-metal/launcher.sh
+exec /home/fekry/Projects/llama-bare-metal/launcher.sh

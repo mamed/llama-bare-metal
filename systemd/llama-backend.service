@@ -5,13 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/fekry/llama-bare-metal
-Environment=CONFIG_FILE=/home/fekry/llama-cpp-docker/llama-unified/models.yaml
+WorkingDirectory=/home/fekry/Projects/llama-bare-metal
+Environment=CONFIG_FILE=/home/fekry/Projects/llama-cpp-unified/models.yaml
 Environment=MODELS_DIR=/home/fekry/llama-models/LLM-Models
 # Pin to the 3D V-Cache CCD (cores 0-7 = 96 MB L3 vs cores 8-15 = 32 MB L3).
 # KV cache streaming benefits from lower L3 latency.
 ExecStartPre=/bin/mkdir -p /tmp/llama-slots
-ExecStart=/usr/bin/taskset -c 0-7 /home/fekry/llama-bare-metal/llama-backend.sh
+ExecStart=/usr/bin/taskset -c 0-7 /home/fekry/Projects/llama-bare-metal/llama-backend.sh
 ExecStop=/bin/rm -f %t/llama-backend.model
 Restart=on-failure
 RestartSec=5

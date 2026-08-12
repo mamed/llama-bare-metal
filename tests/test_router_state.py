@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from pathlib import Path
 import pytest
 from llama_bare.router_state import (read_current_model, write_current_model, write_env_file, load_models_from_yaml, resolve_model_path, list_models_sorted_by_basename)
@@ -168,3 +170,214 @@ def test_list_models_sorted_by_basename_single_model_dict_shape(tmp_path):
     result = list_models_sorted_by_basename(yaml)
     assert len(result) == 1
     assert result[0]['name'] == 'single'
+
+
+# ---- B3: atomic .env write + concurrent-state safety ----
+
+def test_write_env_file_is_atomic(tmp_path, monkeypatch):
+    """B3: write_env_file must use a temp+replace pattern so a crash mid-write
+    never leaves .env in a partial state. We inject a crash during the
+    `os.replace` call (the rename-step of temp+replace). The original
+    write_text()-based implementation truncates first, so a crash during
+    os.replace leaves empty content; the fixed version keeps the old
+    content because the rename never succeeds."""
+    import llama_bare.router_state as rs
+    target = tmp_path / 'env'
+    write_env_file(target, 'old-name')
+
+    # Make os.replace fail mid-flight (simulates crash between temp-create
+    # and rename-to-target).
+    call_count = {"n": 0}
+    real_replace = rs.os.replace
+
+    def flaky_replace(src, dst, *args, **kwargs):
+        call_count["n"] += 1
+        # First call (write_env_file): refuse to commit.
+        if call_count["n"] == 1:
+            raise OSError("simulated crash during rename")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(rs.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError):
+        write_env_file(target, 'new-name')
+
+    # Atomic invariant: file contents are EXACTLY the old payload, never empty.
+    assert target.read_text() == 'MODEL_NAME=old-name\n'
+
+    # When os.replace works, the new value lands cleanly.
+    monkeypatch.undo()
+    write_env_file(target, 'new-name')
+    assert target.read_text() == 'MODEL_NAME=new-name\n'
+
+
+def test_state_file_lock_concurrent_writes(tmp_path):
+    """B3: 10 threads writing the same file simultaneously must produce
+    EITHER the old contents OR one of the new contents — never a corrupt
+    half-written mix."""
+    state = tmp_path / 'state.txt'
+    write_current_model(state, 'initial')
+    errors = []
+
+    def writer(name):
+        try:
+            for _ in range(20):
+                write_current_model(state, name)
+        except Exception as e:  # pragma: no cover — only fires if locking fails
+            errors.append((name, e))
+
+    threads = [threading.Thread(target=writer, args=(f"writer-{i}",)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent writers raised: {errors}"
+    final = state.read_text()
+    assert final.startswith("MODEL_NAME=") or final.startswith("writer-") or final.strip() == "initial"
+    # The file must end with exactly one newline (atomic write invariant).
+    assert final.endswith("\n")
+    # The body must be a single line (no partial writes interleaved).
+    lines = final.splitlines()
+    assert len(lines) == 1, f"file has multiple lines — partial write leaked: {final!r}"
+
+
+def test_state_file_lock_concurrent_reads_during_write(tmp_path):
+    """B3: While one writer is hammering the state file, concurrent readers
+    must NEVER see a ValueError, OSError, or partial parse — they see either
+    the old content or the new content."""
+    state = tmp_path / 'state.txt'
+    write_current_model(state, 'baseline')
+    stop = threading.Event()
+    errors = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                # read_current_model must always return a non-corrupt string-or-None.
+                value = read_current_model(state)
+                if value is not None:
+                    # The loader strips; check format pin: no newlines embedded.
+                    assert "\n" not in value, f"read saw newline in {value!r}"
+            except Exception as e:  # pragma: no cover — only fires on real lock failure
+                errors.append(e)
+
+    def writer():
+        for i in range(200):
+            write_current_model(state, f"model-{i}")
+
+    readers = [threading.Thread(target=reader) for _ in range(10)]
+    writ = threading.Thread(target=writer)
+    for r in readers:
+        r.start()
+    writ.start()
+    writ.join()
+    time.sleep(0.05)  # let readers drain
+    stop.set()
+    for r in readers:
+        r.join()
+
+    assert not errors, f"concurrent readers raised: {errors}"
+
+
+# ---- B4/B7: cached wrappers for yaml reads ----
+# The cache lives at module level so all callers share it. We pin behaviour
+# via the path-keyed cache so multiple test files can coexist.
+
+def test_cached_load_models_caches(tmp_path):
+    """B4: Two reads in quick succession on an unchanged file hit the cache:
+    the second call's parsed value matches the first, and both reads
+    share the same mtime entry in the module cache.
+    """
+    import llama_bare.router_state as rs
+    yaml = tmp_path / 'models.yaml'
+    yaml.write_text('models:\n- name: a\n- name: b\n')
+
+    # Reset cache for this path so previous tests don't leak.
+    rs._yaml_cache.pop(str(yaml.resolve()), None)
+
+    first = rs.cached_load_models_from_yaml(yaml)
+    second = rs.cached_load_models_from_yaml(yaml)
+    assert first == {'a', 'b'}
+    assert second == first
+    # The cache must contain the path with a fresh mtime.
+    key = str(yaml.resolve())
+    assert key in rs._yaml_cache
+    cached_mtime, cached_set = rs._yaml_cache[key]
+    assert cached_set == {'a', 'b'}
+
+
+def test_cached_load_models_invalidates_on_mtime(tmp_path):
+    """B4: When the file's mtime advances, the cached loader re-reads it."""
+    import llama_bare.router_state as rs
+    yaml = tmp_path / 'models.yaml'
+    yaml.write_text('models:\n- name: a\n')
+
+    key = str(yaml.resolve())
+    rs._yaml_cache.pop(key, None)
+    first = rs.cached_load_models_from_yaml(yaml)
+    assert first == {'a'}
+
+    # Force a future mtime so the next read sees a change.
+    import os
+    new_mtime = yaml.stat().st_mtime + 5
+    os.utime(yaml, (new_mtime, new_mtime))
+    yaml.write_text('models:\n- name: a\n- name: b\n')
+
+    second = rs.cached_load_models_from_yaml(yaml)
+    assert second == {'a', 'b'}, f"cache should refresh on mtime change: {second}"
+
+
+def test_cached_list_models_caches(tmp_path):
+    """B7: Two reads on an unchanged file return the same cached list."""
+    import llama_bare.router_state as rs
+    yaml = tmp_path / 'models.yaml'
+    yaml.write_text('models:\n- name: b\n- name: a\n')
+
+    key = str(yaml.resolve())
+    rs._yaml_list_cache.pop(key, None)
+    first = rs.cached_list_models_sorted_by_basename(yaml)
+    second = rs.cached_list_models_sorted_by_basename(yaml)
+    assert [m['name'] for m in first] == ['a', 'b']
+    assert [m['name'] for m in second] == ['a', 'b']
+    assert key in rs._yaml_list_cache
+
+
+def test_cached_list_models_invalidates_on_mtime(tmp_path):
+    """B7: When the file's mtime advances, the cached list loader re-reads it."""
+    import llama_bare.router_state as rs
+    yaml = tmp_path / 'models.yaml'
+    yaml.write_text('models:\n- name: b\n- name: a\n')
+
+    key = str(yaml.resolve())
+    rs._yaml_list_cache.pop(key, None)
+    first = rs.cached_list_models_sorted_by_basename(yaml)
+    assert [m['name'] for m in first] == ['a', 'b']
+
+    import os
+    new_mtime = yaml.stat().st_mtime + 5
+    os.utime(yaml, (new_mtime, new_mtime))
+    yaml.write_text('models:\n- name: z\n')
+
+    second = rs.cached_list_models_sorted_by_basename(yaml)
+    assert [m['name'] for m in second] == ['z'], f"cache should refresh on mtime change: {second}"
+
+
+def test_cached_load_models_falls_back_when_missing(tmp_path):
+    """B4: A missing file must NOT be cached (mtime would be 0)."""
+    import llama_bare.router_state as rs
+    missing = tmp_path / 'nonexistent.yaml'
+    # No write_text — file does not exist.
+    result = rs.cached_load_models_from_yaml(missing)
+    assert result == set()
+    # The cache must not be poisoned with a stale entry.
+    assert str(missing.resolve()) not in rs._yaml_cache
+
+
+def test_cached_list_models_falls_back_when_missing(tmp_path):
+    """B7: A missing file must NOT be cached for the list loader either."""
+    import llama_bare.router_state as rs
+    missing = tmp_path / 'nonexistent.yaml'
+    result = rs.cached_list_models_sorted_by_basename(missing)
+    assert result == []
+    assert str(missing.resolve()) not in rs._yaml_list_cache

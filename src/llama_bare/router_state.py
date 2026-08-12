@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import yaml
 
 from .path_translate import translate_path
 
 PathLike = Union[str, os.PathLike]
+
+
+# B3: Module-level lock guarding state-file and .env operations. Both files
+# are small (one line) and contended by 1-2 concurrent writers plus N readers,
+# so a single lock is enough — no need for RLock or finer-grained locks.
+_state_lock = threading.Lock()
+
+
+# B4/B7: Module-level caches for models.yaml reads. Keyed by absolute path;
+# value is (mtime, parsed). On every call we stat the file and serve from
+# cache if the mtime is unchanged. This avoids re-parsing on every request
+# when models.yaml has 1000+ entries.
+_yaml_cache: dict[str, tuple[float, set[str]]] = {}
+_yaml_list_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_yaml_cache_lock = threading.Lock()
 
 
 def read_current_model(state_file: PathLike) -> Optional[str]:
@@ -20,7 +36,7 @@ def read_current_model(state_file: PathLike) -> Optional[str]:
     garbage content).
     """
     try:
-        with open(state_file) as stream:
+        with _state_lock, open(state_file) as stream:
             data = yaml.safe_load(stream)
     except (OSError, ValueError, yaml.YAMLError):
         return None
@@ -45,24 +61,42 @@ def write_current_model(state_file: PathLike, model_name: str) -> None:
     the legacy bash wrapper's `echo "$MODEL_NAME" > "$STATE_FILE"` format
     exactly, so hand-edits and existing tooling see consistent content.
 
-    Atomic via temp-file + os.replace(). Creates parent directories as needed.
+    Atomic via temp-file + os.replace() under the module-level lock so
+    concurrent writers don't collide on the .tmp name and readers don't
+    see a half-written file. Creates parent directories as needed.
     """
     target = Path(state_file)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
-    with open(temporary, "w") as stream:
-        stream.write(f"{model_name}\n")
-    os.replace(temporary, target)
+    # B3: explicit open()/write()/replace() so we hold the file only long
+    # enough to write+rename atomically, all under the module lock. We do
+    # NOT use Path.write_text() because that opens/closes the target file
+    # directly (a crash mid-truncate would leave .env empty).
+    with _state_lock:
+        with open(temporary, "w") as stream:
+            stream.write(f"{model_name}\n")
+        os.replace(temporary, target)
 
 
 def write_env_file(env_file: PathLike, model_name: str) -> None:
     """Write the .env file with `MODEL_NAME=<model_name>\\n`.
 
     Overwrites any existing content. Creates parent directories as needed.
+    Atomic via temp-file + os.replace() (B3) so a crash mid-write never
+    leaves .env partially written — readers either see the previous
+    contents or the new contents, never a torn half-line.
     """
     target = Path(env_file)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(f"MODEL_NAME={model_name}\n")
+    temporary = target.with_name(target.name + ".tmp")
+    # B3: explicit open()/write()/replace() so the rename is atomic.
+    # Path.write_text() uses `with` semantics to auto-close the file, but
+    # that pattern truncates the target directly on failure. Using a temp
+    # file means the target stays intact if the rename never completes.
+    with _state_lock:
+        with open(temporary, "w") as stream:
+            stream.write(f"MODEL_NAME={model_name}\n")
+        os.replace(temporary, target)
 
 
 def load_models_from_yaml(yaml_path: PathLike) -> set[str]:
@@ -129,3 +163,49 @@ def list_models_sorted_by_basename(yaml_path: PathLike) -> list[dict]:
         name = m.get("name") or ""
         return (basename, name.lower())
     return sorted(entries, key=sort_key)
+
+
+# ---- B4/B7: mtime-keyed caches ----
+
+def cached_load_models_from_yaml(yaml_path: PathLike) -> set[str]:
+    """B4: Return the set of valid models, cached by file mtime.
+
+    Re-uses the parsed result while the file's mtime is unchanged. When
+    an operator edits models.yaml the mtime advances and we reparse.
+    Missing files are NOT cached (they're cheap; we don't want a stale
+    empty set serving requests after the file is created).
+    """
+    key = str(Path(yaml_path).resolve())
+    try:
+        mtime = os.stat(key).st_mtime
+    except OSError:
+        # Can't cache a file we can't stat — fall through to a direct read.
+        return load_models_from_yaml(key)
+    with _yaml_cache_lock:
+        cached = _yaml_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return set(cached[1])  # copy so callers can't mutate cache
+    result = load_models_from_yaml(key)
+    with _yaml_cache_lock:
+        _yaml_cache[key] = (mtime, set(result))
+    return result
+
+
+def cached_list_models_sorted_by_basename(yaml_path: PathLike) -> list[dict]:
+    """B7: Return sorted list of model entries, cached by file mtime.
+
+    Same mtime-keyed strategy as ``cached_load_models_from_yaml`` above.
+    """
+    key = str(Path(yaml_path).resolve())
+    try:
+        mtime = os.stat(key).st_mtime
+    except OSError:
+        return list_models_sorted_by_basename(key)
+    with _yaml_cache_lock:
+        cached = _yaml_list_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return list(cached[1])
+    result = list_models_sorted_by_basename(key)
+    with _yaml_cache_lock:
+        _yaml_list_cache[key] = (mtime, list(result))
+    return result

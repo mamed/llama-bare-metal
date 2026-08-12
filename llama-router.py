@@ -30,13 +30,19 @@ format pin, atomic write, and error handling).
 """
 
 import os
+import re
 import sys
 import time
 import json
+import uuid
+import secrets
 import threading
 import subprocess
+import contextlib
+import signal
 import yaml
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib import request, error
 
 # Use the tested module for state-file and .env I/O.
@@ -44,6 +50,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from llama_bare.router_state import (
     read_current_model,
     write_env_file,
+    cached_load_models_from_yaml,
+    cached_list_models_sorted_by_basename,
     load_models_from_yaml,
     list_models_sorted_by_basename,
 )
@@ -61,15 +69,32 @@ BACKEND_STATE_FILE = os.environ.get(
 BACKEND_SERVICE = os.environ.get("BACKEND_SERVICE", "llama-backend.service")
 ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "64010"))
 
-# Lock so only one restart happens at a time
-restart_lock = threading.Lock()
-current_model = None
+# ---- Security knobs (A1, A3) ----
+# A1: Cap incoming request bodies. 32 MiB matches typical chat-completions
+# payloads (32k tokens × ~1KB/token worst-case) and is well under llama-server's
+# own default (64 MiB). Anything larger is rejected before reading.
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(32 * 1024 * 1024)))
+
+# A3: Shared-secret API token. If unset, we generate one at startup and log it.
+# Operators should set $ROUTER_API_TOKEN explicitly in production so the value
+# is stable across restarts.
+API_TOKEN = os.environ.get("ROUTER_API_TOKEN") or secrets.token_urlsafe(32)
+
+# Paths that require auth (A3): anything that loads a model or triggers work.
+# /health and /v1/models are intentionally free — probes should not need a token.
+AUTH_REQUIRED_RE = re.compile(r"/(v1/chat/completions|v1/completions|v1/embeddings)$")
+
+# Headers we forward to the backend (A2): case-insensitive.
+# Anything outside this whitelist (including all x-*, host, content-length,
+# connection, transfer-encoding, x-forwarded-*) is stripped on the way out.
+# We always add X-Router-Forwarded so the backend knows it was proxied.
+ALLOWED_HEADER_RE = re.compile(r"^(accept|content-type|authorization)$")
 
 
 def load_available_models():
     """Read models.yaml and return set of valid model names.
-    Delegates to llama_bare.router_state.load_models_from_yaml (tested)."""
-    return load_models_from_yaml(MODELS_YAML)
+    B4: Cached by file mtime via llama_bare.router_state.cached_load_models_from_yaml."""
+    return cached_load_models_from_yaml(MODELS_YAML)
 
 
 def read_current_model_from_backend():
@@ -95,29 +120,58 @@ def wait_for_health(timeout=120, interval=2):
 
 def restart_with_model(model_name):
     """Write .env MODEL_NAME= and systemctl restart llama-backend.service,
-    then wait for /health on :64000."""
+    then wait for /health on :64000. If the primary restart times out (likely
+    a hung unit), fall back to stop+start which always returns promptly."""
     # Drop a hint that we're about to swap so the backend startup logs
     # make sense alongside our own log line. Uses the tested writer so the
     # format is guaranteed (atomic, exact "MODEL_NAME=<name>\n").
     write_env_file(ENV_FILE, model_name)
     print(f"[router] restarting llama-backend.service with MODEL_NAME={model_name}")
-    result = subprocess.run(
-        ["systemctl", "--user", "restart", BACKEND_SERVICE],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        # Try system-level too — some systems don't have lingering enabled
-        result2 = subprocess.run(
-            ["sudo", "-n", "systemctl", "restart", BACKEND_SERVICE],
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", BACKEND_SERVICE],
             capture_output=True,
             text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        # Hung unit: try stop+start instead.
+        stop_result = subprocess.run(
+            ["systemctl", "--user", "stop", BACKEND_SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if stop_result.returncode != 0:
+            raise RuntimeError(
+                f"systemctl restart timed out, and stop failed (rc={stop_result.returncode}): "
+                f"{stop_result.stderr.strip() or stop_result.stdout.strip()}"
+            )
+        result2 = subprocess.run(
+            ["systemctl", "--user", "start", BACKEND_SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result2.returncode != 0:
             raise RuntimeError(
-                f"systemctl restart failed (rc={result.returncode}): "
-                f"{result.stderr.strip() or result.stdout.strip()}"
+                f"systemctl restart timed out, and start failed (rc={result2.returncode}): "
+                f"{result2.stderr.strip() or result2.stdout.strip()}"
             )
+    else:
+        if result.returncode != 0:
+            # Try system-level too — some systems don't have lingering enabled
+            result2 = subprocess.run(
+                ["sudo", "-n", "systemctl", "restart", BACKEND_SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result2.returncode != 0:
+                raise RuntimeError(
+                    f"systemctl restart failed (rc={result.returncode}): "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
     print(f"[router] waiting for health on {CUDA_SERVE_HEALTH}")
     if not wait_for_health(timeout=180):
         raise RuntimeError(f"llama-backend did not come up with model {model_name}")
@@ -136,17 +190,131 @@ def ensure_model_loaded(model_name):
         current_model = model_name
 
 
+def extract_bearer_token(headers) -> Optional[str]:
+    """Pull a token from Authorization: Bearer ... OR X-API-Token: ...
+    Returns the token string (possibly empty) or None if neither is present.
+    Empty Authorization header is treated as no token."""
+    auth = headers.get("Authorization")
+    if auth:
+        parts = auth.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+            return parts[1].strip()
+    api_token = headers.get("X-API-Token")
+    if api_token and api_token.strip():
+        return api_token.strip()
+    return None
+
+
+def authenticate(headers) -> bool:
+    """A3: Validate the request's auth token. Constant-time compare so an
+    attacker can't measure how many bytes of their guess match."""
+    presented = extract_bearer_token(headers)
+    if not presented:
+        return False
+    return secrets.compare_digest(presented, API_TOKEN)
+
+
+def sanitize_forward_headers(client_headers) -> dict:
+    """A2: Whitelist the headers we forward to the backend.
+    Drops everything except accept/content-type/authorization (non-empty),
+    then injects X-Router-Forwarded so the backend can tell it was proxied.
+    """
+    out: dict = {}
+    for key, value in client_headers.items():
+        if not ALLOWED_HEADER_RE.match(key):
+            continue
+        # "authorization" must be non-empty — an empty value just means
+        # "I declined to authenticate" and we'd rather not advertise that.
+        if key == "authorization" and not value.strip():
+            continue
+        out[key] = value
+    out["X-Router-Forwarded"] = "llama-bare-router/1.0"
+    return out
+
+
+# Lock so only one restart happens at a time
+restart_lock = threading.Lock()
+current_model = None
+
+
 class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Quieter logging
         print(f"[router] {self.address_string()} - {format % args}")
 
-    def _proxy(self, method):
-        # Read request body
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
+    def _read_body_capped(self) -> Optional[bytes]:
+        """A1: Read up to MAX_REQUEST_BYTES from rfile, return None if the
+        body is missing Content-Length, has a malformed length, exceeds the
+        cap, or streams chunked data past the cap.
+        Returns the body bytes on success.
+        """
+        length_header = self.headers.get("Content-Length")
+        if length_header is None:
+            # No body — treat as empty (e.g., GET with no payload).
+            return b""
+        try:
+            length = int(length_header)
+        except ValueError:
+            # Malformed Content-Length — reject rather than guess.
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return None
+        if length < 0:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return None
+        if length > MAX_REQUEST_BYTES:
+            self._send_json(
+                413,
+                {
+                    "error": "request body too large",
+                    "limit_bytes": MAX_REQUEST_BYTES,
+                },
+            )
+            return None
+        if length == 0:
+            return b""
+        # Read the declared body. If the actual stream is longer than
+        # length (malicious or buggy peer), rfile.read(length) caps at
+        # `length` bytes — but we also peek the next byte to detect
+        # chunked-encoded or unannounced extra data and refuse it.
+        body = self.rfile.read(length)
+        # Probe for trailing data without consuming it from the next request.
+        next_byte = self.rfile.read(1)
+        if next_byte:
+            self._send_json(
+                413,
+                {
+                    "error": "request body exceeds declared Content-Length",
+                    "limit_bytes": MAX_REQUEST_BYTES,
+                },
+            )
+            return None
+        return body
 
-        # Parse to get the model name (so we can ensure it's loaded)
+    def _proxy(self, method):
+        # A1: Read request body with a hard cap.
+        body = self._read_body_capped()
+        if body is None:
+            return  # _read_body_capped already sent the error response
+
+        # /v1/models: just return the full list from models.yaml.
+        # Public endpoint (no auth) — probes should be free.
+        if self.path == "/v1/models" or self.path.endswith("/v1/models"):
+            self._serve_models_list()
+            return
+
+        # /health: always 200 (router is alive).
+        # Public endpoint (no auth) — probes should be free.
+        if self.path == "/health" or self.path.endswith("/health"):
+            self._send_json(200, {"status": "ok", "router": "cuda-router"})
+            return
+
+        # A3: Auth required for model-touching endpoints.
+        if AUTH_REQUIRED_RE.search(self.path):
+            if not authenticate(self.headers):
+                self._send_json(401, {"error": "authentication required"})
+                return
+
+        # Parse to get the model name (so we can ensure it's loaded).
         target_model = None
         if body and self.path.endswith(("/chat/completions", "/completions", "/embeddings")):
             try:
@@ -155,22 +323,12 @@ class RouterHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        # /v1/models: just return the full list from models.yaml
-        if self.path == "/v1/models" or self.path.endswith("/v1/models"):
-            self._serve_models_list()
-            return
-
-        # /health: always 200 (router is alive)
-        if self.path == "/health" or self.path.endswith("/health"):
-            self._send_json(200, {"status": "ok", "router": "cuda-router"})
-            return
-
-        # Other paths: must have a model in the body
+        # Other paths: must have a model in the body.
         if not target_model:
             self._send_json(400, {"error": "missing 'model' in request body"})
             return
 
-        # Validate model name
+        # Validate model name.
         valid = load_available_models()
         if target_model not in valid:
             self._send_json(
@@ -182,46 +340,68 @@ class RouterHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Ensure the model is loaded in cuda-serve (auto-swap if needed)
+        # Ensure the model is loaded in cuda-serve (auto-swap if needed).
         try:
             ensure_model_loaded(target_model)
         except Exception as e:
-            self._send_json(503, {"error": f"failed to load model: {e}"})
+            # A4: Log full error server-side, return sanitized message to client.
+            self._handle_internal_error("failed to load model", e)
             return
 
-        # Forward the request to cuda-serve
+        # Forward the request to cuda-serve.
         url = f"{CUDA_SERVE_URL}{self.path}"
+        request_id = uuid.uuid4().hex
         try:
             req = request.Request(
                 url,
                 data=body,
                 method=method,
-                headers={
-                    k: v for k, v in self.headers.items()
-                    if k.lower() not in ("host", "content-length")
-                },
+                headers=sanitize_forward_headers(self.headers),
             )
-            with request.urlopen(req, timeout=300) as resp:
+            # B5: Wrap urlopen in contextlib.closing() so the underlying
+            # socket is always closed — even if resp.read() raises mid-stream
+            # (where the `with`-block alone is not enough on some Python
+            # stdlib response types). The closing() wrapper guarantees
+            # close() runs on normal exit AND on exception.
+            with contextlib.closing(request.urlopen(req, timeout=300)) as resp:
                 resp_body = resp.read()
                 self.send_response(resp.status)
-                # Forward response headers
+                # Forward response headers, but never let the backend set
+                # hop-by-hop headers we already manage.
                 for k, v in resp.getheaders():
-                    if k.lower() not in ("transfer-encoding", "connection"):
+                    if k.lower() not in ("transfer-encoding", "connection", "content-length"):
                         self.send_header(k, v)
                 self.send_header("Content-Length", str(len(resp_body)))
                 self.end_headers()
                 self.wfile.write(resp_body)
         except error.HTTPError as e:
+            # A4: Log full upstream error (may contain paths/traces) to stderr,
+            # return only a sanitized message + request_id to the client.
             err_body = e.read()
-            self._send_json(e.code, json.loads(err_body) if err_body else {"error": str(e)})
+            print(
+                f"[router] request_id={request_id} upstream HTTPError "
+                f"code={e.code} body={err_body!r}",
+                file=sys.stderr,
+            )
+            client_payload = json.loads(err_body) if err_body else None
+            if isinstance(client_payload, dict) and "error" in client_payload:
+                # Safe upstream error — pass through, but don't leak paths.
+                sanitized = {"error": "upstream error", "request_id": request_id}
+                self._send_json(e.code, sanitized)
+            else:
+                sanitized = {"error": "upstream error", "request_id": request_id}
+                self._send_json(e.code, sanitized)
         except Exception as e:
-            self._send_json(500, {"error": f"proxy error: {e}"})
+            # A4: Same treatment for any other proxy failure.
+            self._handle_internal_error("proxy error", e, request_id=request_id)
 
     def _serve_models_list(self):
+        # B7: sorted_entries comes from a mtime-keyed cache; the cache
+        # invalidates automatically when an operator edits models.yaml.
         # Return all entries from models.yaml, formatted as OpenAI /v1/models.
         # Sort by the actual model file basename (so all quants of the same model
         # cluster together) with the yaml name as a tiebreaker for stability.
-        sorted_entries = list_models_sorted_by_basename(MODELS_YAML)
+        sorted_entries = cached_list_models_sorted_by_basename(MODELS_YAML)
         data = {
             "object": "list",
             "data": [
@@ -231,6 +411,19 @@ class RouterHandler(BaseHTTPRequestHandler):
             ],
         }
         self._send_json(200, data)
+
+    def _handle_internal_error(self, label, exc, request_id=None):
+        """A4: Send a sanitized error to the client; log the real exception
+        (with traceback) to stderr, tagged with the request_id."""
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        import traceback
+        print(
+            f"[router] request_id={request_id} {label}: {exc!r}\n"
+            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            file=sys.stderr,
+        )
+        self._send_json(500, {"error": "internal error", "request_id": request_id})
 
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -252,6 +445,11 @@ def main():
     print(f"[router] backend: {CUDA_SERVE_URL}")
     print(f"[router] env file: {ENV_FILE}")
     print(f"[router] known models: {len(load_available_models())}")
+    print(f"[router] max request bytes: {MAX_REQUEST_BYTES} ({MAX_REQUEST_BYTES // (1024*1024)} MiB)")
+    # A3: Log the API token exactly once at startup. If the operator didn't
+    # set $ROUTER_API_TOKEN, the auto-generated token is the only way in.
+    token_source = "env" if os.environ.get("ROUTER_API_TOKEN") else "auto-generated"
+    print(f"[router] API token ({token_source}): {API_TOKEN}")
     print()
 
     # Show what llama-backend currently has

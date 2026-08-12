@@ -302,9 +302,14 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "router": "cuda-router"})
             return
 
-        # A3: Auth required for model-touching endpoints.
+        # A3: Auth required for model-touching endpoints,
+        # UNLESS the request came from loopback (127.0.0.1 or ::1).
+        # Local clients (open-webui, Hermes Agent, OpenClaw, custom scripts)
+        # don't need to set auth headers when talking to localhost.
         if AUTH_REQUIRED_RE.search(self.path):
-            if not authenticate(self.headers):
+            client_ip = self.client_address[0] if self.client_address else None
+            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+            if not is_loopback and not authenticate(self.headers):
                 self._send_json(401, {"error": "authentication required"})
                 return
 

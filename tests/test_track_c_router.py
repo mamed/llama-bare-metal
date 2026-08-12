@@ -70,13 +70,13 @@ class _FakeRequest:
     """Minimal BaseHTTPRequestHandler per-request state, in-memory."""
 
     def __init__(self, *, method="POST", path="/v1/chat/completions", headers=None,
-                 body=b""):
+                 body=b"", client_address=("127.0.0.1", 0)):
         self.headers = dict(headers or {})
         self.path = path
         self.command = method
         self.request_version = "HTTP/1.1"
         self.requestline = f"{method} {path} HTTP/1.1"
-        self.client_address = ("127.0.0.1", 0)
+        self.client_address = client_address
         self.rfile = io.BytesIO(body)
         self.wfile = io.BytesIO()
         self._logs = []
@@ -324,7 +324,14 @@ def test_do_post_without_auth_returns_401(router_with_token):
         "Content-Type": "application/json",
         "Content-Length": str(len(body)),
     }
-    req = _FakeRequest(method="POST", path="/v1/chat/completions", headers=headers, body=body)
+    # PHASE I: non-loopback client — auth gate still fires.
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers=headers,
+        body=body,
+        client_address=("192.168.1.5", 54321),
+    )
     handler = _build_handler(router_with_token, req)
     handler.do_POST()
     code, payload = _read_json_response(req.wfile)
@@ -382,7 +389,14 @@ def test_do_post_with_wrong_token_returns_401(router_with_token):
         "Content-Type": "application/json",
         "Content-Length": str(len(body)),
     }
-    req = _FakeRequest(method="POST", path="/v1/chat/completions", headers=headers, body=body)
+    # PHASE I: non-loopback client — auth gate still fires.
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers=headers,
+        body=body,
+        client_address=("192.168.1.5", 54321),
+    )
     handler = _build_handler(router_with_token, req)
     handler.do_POST()
     code, payload = _read_json_response(req.wfile)

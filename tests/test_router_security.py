@@ -64,7 +64,7 @@ class _FakeRequest:
     """Minimal stand-in for BaseHTTPRequestHandler's per-request state."""
 
     def __init__(self, *, method="POST", path="/v1/chat/completions", headers=None,
-                 body=b"", query_string=""):
+                 body=b"", query_string="", client_address=("127.0.0.1", 0)):
         # self.headers is an .items()-iterable mapping.
         self.headers = dict(headers or {})
         self.path = path
@@ -72,7 +72,7 @@ class _FakeRequest:
         self.request_version = "HTTP/1.1"
         # requestline is what send_response → log_request reads.
         self.requestline = f"{method} {path} HTTP/1.1"
-        self.client_address = ("127.0.0.1", 0)
+        self.client_address = client_address
         # self.rfile: BytesIO so rfile.read(n) is bounded
         self.rfile = io.BytesIO(body)
         # self.wfile: capture what the handler writes back to the client
@@ -231,20 +231,23 @@ def test_request_body_size_limit_chunked(router_default):
     declared = 16
     extra = b'x' * 32  # extra bytes past declared length
     actual = b'{"model":"x"}' + extra
+    # PHASE I: Use a non-loopback IP so the auth gate still fires (we
+    # want this test to exercise the auth path, not the loopback bypass).
     req = _FakeRequest(
         method="POST",
         path="/v1/chat/completions",
         headers={"Content-Length": str(declared), "Content-Type": "application/json"},
         body=actual,
+        client_address=("192.168.1.5", 54321),
     )
     handler = _build_handler(router_default, req)
     handler.do_POST()
     code, _payload = _read_json_response(req.wfile)
-    # We expect either 401 (auth-required, body was truncated and forwarded)
-    # or 200 (auth bypassed, body was forwarded at declared length).
-    # Either way: NOT 413 (the chunked-probe path is gone), NOT a hang.
-    assert code in (200, 401), (
-        f"expected 200/401 (silently truncated, no hang), got {code}"
+    # We expect 401 (auth-required, body was truncated and forwarded).
+    # NOT 413 (the chunked-probe path is gone), NOT a hang.
+    assert code == 401, (
+        f"expected 401 (silently truncated, no hang, non-loopback hits auth), "
+        f"got {code} payload={_payload}"
     )
 
 
@@ -396,11 +399,13 @@ def test_no_auth_required_for_v1_models(router_default, monkeypatch):
 
 def test_auth_required_for_chat_completions(router_default):
     """A3: POST /v1/chat/completions without auth → 401."""
+    # PHASE I: non-loopback client — auth gate still fires.
     req = _FakeRequest(
         method="POST",
         path="/v1/chat/completions",
         headers={"Content-Type": "application/json"},
         body=b'{"model":"x"}',
+        client_address=("192.168.1.5", 54321),
     )
     handler = _build_handler(router_default, req)
     handler.do_POST()
@@ -415,11 +420,13 @@ def test_auth_required_for_chat_completions(router_default):
 
 def test_auth_required_for_completions(router_default):
     """A3: POST /v1/completions without auth → 401."""
+    # PHASE I: non-loopback client — auth gate still fires.
     req = _FakeRequest(
         method="POST",
         path="/v1/completions",
         headers={"Content-Type": "application/json"},
         body=b'{"model":"x"}',
+        client_address=("192.168.1.5", 54321),
     )
     handler = _build_handler(router_default, req)
     handler.do_POST()
@@ -433,11 +440,13 @@ def test_auth_required_for_completions(router_default):
 
 def test_auth_required_for_embeddings(router_default):
     """A3: POST /v1/embeddings without auth → 401."""
+    # PHASE I: non-loopback client — auth gate still fires.
     req = _FakeRequest(
         method="POST",
         path="/v1/embeddings",
         headers={"Content-Type": "application/json"},
         body=b'{"model":"x","input":"hi"}',
+        client_address=("192.168.1.5", 54321),
     )
     handler = _build_handler(router_default, req)
     handler.do_POST()
@@ -514,11 +523,13 @@ def test_auth_rejects_wrong_token(router_default):
     # Even a token that's "almost right" should fail.
     almost_right = router_default.API_TOKEN[:-1] + "X"
     for bad in ("definitely-wrong", "", almost_right, router_default.API_TOKEN + "x"):
+        # PHASE I: non-loopback client — auth gate still fires.
         req = _FakeRequest(
             method="POST",
             path="/v1/chat/completions",
             headers={"Authorization": f"Bearer {bad}"},
             body=b'{"model":"x"}',
+            client_address=("192.168.1.5", 54321),
         )
         handler = _build_handler(router_default, req)
         handler.do_POST()
@@ -1199,3 +1210,149 @@ def test_read_body_capped_no_probe(router_default):
     assert "self.rfile.read(length)" in src, (
         "expected plain `self.rfile.read(length)` body read in _read_body_capped"
     )
+
+
+# ===========================================================================
+# PHASE I: Loopback auth bypass — local clients (127.0.0.1 / ::1) hit the
+# service without setting an API token. Non-loopback clients still must
+# present a valid token. This keeps the service safe if it ever gets exposed
+# to a non-loopback network while letting Hermes Agent, open-webui, OpenClaw,
+# and ad-hoc scripts talk to localhost without ceremony.
+# ===========================================================================
+
+
+def _stub_loopback_forward(mod, monkeypatch):
+    """Common stubs for the loopback-bypass tests so each test only has to
+    assert on the response code — not on the proxy plumbing."""
+    monkeypatch.setattr(mod, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(mod, "load_available_models", lambda: {"m"})
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlOpenResponse(
+            body=b'{"id":"r","choices":[]}', status=200, headers=[]
+        )
+
+    monkeypatch.setattr(mod.request, "urlopen", fake_urlopen)
+
+
+def test_loopback_bypasses_auth(router_default, monkeypatch):
+    """PHASE I #1: POST /v1/chat/completions from 127.0.0.1 with NO auth
+    headers → 200 (auth is bypassed because the client is loopback)."""
+    _stub_loopback_forward(router_default, monkeypatch)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            # Deliberately no Authorization / X-API-Token header.
+        },
+        body=body,
+        client_address=("127.0.0.1", 54321),
+    )
+    handler = _build_handler(router_default, req)
+    handler.do_POST()
+    code, _payload = _read_json_response(req.wfile)
+    # Must NOT be 401 — loopback bypass wins.
+    assert code != 401, f"loopback request was rejected with 401; payload={_payload}"
+    assert code == 200, f"expected 200 from stubbed upstream, got {code}"
+
+
+def test_loopback_bypasses_auth_ipv6(router_default, monkeypatch):
+    """PHASE I #2: POST from ::1 (IPv6 loopback) with no auth → not 401."""
+    _stub_loopback_forward(router_default, monkeypatch)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+        body=body,
+        client_address=("::1", 54321),
+    )
+    handler = _build_handler(router_default, req)
+    handler.do_POST()
+    code, _payload = _read_json_response(req.wfile)
+    assert code != 401, f"IPv6 loopback request was rejected with 401; payload={_payload}"
+    assert code == 200
+
+
+def test_non_loopback_requires_auth(router_default, monkeypatch):
+    """PHASE I #3: POST from a non-loopback IP (192.168.1.5) with no auth
+    → 401. The auth gate still works for non-loopback clients so the
+    service is safe if it ever gets exposed to a network."""
+    # No stubs needed — auth check rejects before any upstream call.
+    body = b'{"model":"m"}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+        body=body,
+        client_address=("192.168.1.5", 54321),
+    )
+    handler = _build_handler(router_default, req)
+    handler.do_POST()
+    code, payload = _read_json_response(req.wfile)
+    assert code == 401, f"non-loopback without auth must be 401, got {code}"
+    assert "authentication required" in payload["error"]
+
+
+def test_loopback_with_wrong_token_still_works(router_default, monkeypatch):
+    """PHASE I #4: Loopback + a wrong token → still passes (loopback
+    bypass wins; the bad token is irrelevant)."""
+    _stub_loopback_forward(router_default, monkeypatch)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "Authorization": "Bearer this-token-is-deliberately-wrong",
+        },
+        body=body,
+        client_address=("127.0.0.1", 54321),
+    )
+    handler = _build_handler(router_default, req)
+    handler.do_POST()
+    code, _payload = _read_json_response(req.wfile)
+    assert code != 401, (
+        f"loopback request with wrong token was rejected with 401; "
+        f"loopback bypass should make the token irrelevant"
+    )
+    assert code == 200
+
+
+def test_non_loopback_with_valid_token_passes(router_default, monkeypatch):
+    """PHASE I #5: Non-loopback + the right token → 200. Auth gate is
+    intact for non-loopback clients who DO have a token."""
+    _stub_loopback_forward(router_default, monkeypatch)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=body,
+        client_address=("192.168.1.5", 54321),
+    )
+    handler = _build_handler(router_default, req)
+    handler.do_POST()
+    code, _payload = _read_json_response(req.wfile)
+    assert code != 401, (
+        f"non-loopback with valid token was rejected; payload={_payload}"
+    )
+    assert code == 200

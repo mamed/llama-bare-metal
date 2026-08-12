@@ -557,6 +557,26 @@ _swap_in_progress = False
 _swap_in_progress_lock = threading.Lock()
 
 
+# ---- R: Session lock — pin a session to the model from its first request.
+# Hermes Agent / Open WebUI can run 50+ tool-call iterations against a
+# single chat session. If ANY of those requests asks for a different model
+# than the one pinned at session start, the router would normally call
+# ensure_model_loaded → restart_with_model → cut the in-flight response
+# mid-stream (HTTP 500/503 + client retry). We avoid that by remembering
+# the first model each X-Session-Id saw, then overriding the requested
+# model for any later request in the same session.
+#
+# - No X-Session-Id header: behavior is unchanged (no pin, no rewrite).
+# - First request with a new X-Session-Id: pin it to the requested model.
+# - Follow-up with same X-Session-Id: rewrite target_model to the pinned
+#   model so ensure_model_loaded never triggers a mid-session swap.
+# - LRU/FIFO eviction at _SESSION_LOCKS_MAX entries so stale sessions
+#   don't leak memory across a long-lived router.
+_SESSION_LOCKS_MAX = 1000
+_session_locks: dict = {}  # session_id (str) -> pinned model name (str)
+_session_locks_lock = threading.Lock()
+
+
 class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Quieter logging
@@ -691,6 +711,41 @@ class RouterHandler(BaseHTTPRequestHandler):
                 )
                 self._record_request_metric(endpoint_label, 400)
                 return
+
+            # R: Session lock — pin a chat session to the model from its
+            # first request. Prevents mid-session model swaps from killing
+            # in-flight tool-call iterations. No X-Session-Id → unchanged
+            # behavior.
+            session_id = self.headers.get("X-Session-Id")
+            if session_id:
+                with _session_locks_lock:
+                    locked = _session_locks.get(session_id)
+                    if locked and locked != target_model:
+                        # Session is pinned to a different model — honor the
+                        # pin, log the override, do NOT trigger a swap.
+                        logger.info(
+                            "request_id=%s session %r locked to %r; "
+                            "ignoring request for %r (no mid-session swap)",
+                            request_id, session_id, locked, target_model,
+                        )
+                        target_model = locked
+                    elif not locked:
+                        # First request from this session — pin it. Evict
+                        # the oldest entries (FIFO) until we're strictly
+                        # below the cap so the insert keeps us at the cap.
+                        # Python 3.7+ dicts preserve insertion order, so
+                        # `next(iter(d))` is the first-inserted key.
+                        while len(_session_locks) >= _SESSION_LOCKS_MAX:
+                            try:
+                                oldest = next(iter(_session_locks))
+                            except StopIteration:
+                                break
+                            del _session_locks[oldest]
+                        _session_locks[session_id] = target_model
+                        logger.info(
+                            "request_id=%s session %r pinned to %r",
+                            request_id, session_id, target_model,
+                        )
 
             # Ensure the model is loaded in cuda-serve (auto-swap if needed).
             try:

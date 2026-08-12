@@ -7,11 +7,17 @@
 # - Removes $STATE_FILE on exit (any signal)
 set -euo pipefail
 
+# D2: Structured logging — emit to stderr with timestamps so the systemd
+# journal captures them in a parseable format.
+log_info()  { printf '%s INFO: %s\n'  "$(date -Iseconds)" "$*" >&2; }
+log_warn()  { printf '%s WARN: %s\n'  "$(date -Iseconds)" "$*" >&2; }
+log_error() { printf '%s ERROR: %s\n' "$(date -Iseconds)" "$*" >&2; }
+
 ENV_FILE="${ENV_FILE:-/home/fekry/Projects/llama-bare-metal/.env}"
 STATE_FILE="${STATE_FILE:-${XDG_RUNTIME_DIR:-/run/user/$UID}/llama-backend.model}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-    echo "FATAL: env file not found: $ENV_FILE" >&2
+    log_error "FATAL: env file not found: $ENV_FILE"
     exit 1
 fi
 
@@ -22,7 +28,7 @@ source "$ENV_FILE"
 set +a
 
 if [[ -z "${MODEL_NAME:-}" ]]; then
-    echo "FATAL: MODEL_NAME not set in $ENV_FILE" >&2
+    log_error "FATAL: MODEL_NAME not set in $ENV_FILE"
     exit 2
 fi
 

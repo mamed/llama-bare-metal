@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pyyaml prometheus_client
+
+      - name: Run tests with coverage gate
+        run: |
+          PYTHONPATH=src python -m pytest tests/ \
+            --cov=llama_bare --cov-branch \
+            --cov-fail-under=100 -v
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint bash scripts
+        run: |
+          shellcheck launcher.sh llama-backend.sh scripts/find_max_ctx.sh
+          # The test suite also runs shellcheck+bash -n on the same set of
+          # scripts via tests/test_bash_scripts.py — this is a belt-and-
+          # braces check so a CI failure shows up even if the test runner
+          # is skipped.
+
+      - name: Validate monitoring configs
+        run: |
+          python -c "import yaml; yaml.safe_load(open('monitoring/alerts.yml'))"
+          python -c "import yaml; yaml.safe_load(open('monitoring/prometheus.yml'))"

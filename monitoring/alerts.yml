@@ -77,3 +77,38 @@ groups:
         annotations:
           summary: "Speculative decoding acceptance below 30%"
           description: "ngram-cache acceptance rate is {{ $value | humanizePercentage }}. Spec engine is doing more verification than drafting. Could indicate unusual workload. Not necessarily a problem if throughput is still good."
+
+  # D5: Router-level alerts. The router exposes a Prometheus /metrics endpoint
+  # at :64010/metrics so these counters/histograms are available.
+  - name: llama_router_alerts
+    interval: 30s
+    rules:
+      # High error rate — more than 10 5xx in 5 min.
+      - alert: LlamaRouterHighErrorRate
+        expr: rate(llama_router_requests_total{status=~"5.."}[5m]) * 300 > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Router returning many 5xx responses"
+          description: "More than 10 5xx responses in the last 5 minutes. Check journalctl --user -u llama-router.service for sanitized error logs."
+
+      # Backend down (router-side probe).
+      - alert: LlamaRouterBackendDown
+        expr: llama_router_backend_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Router's background probe says backend is down"
+          description: "The router's /health probe to llama-backend has been failing for 2 minutes. The backend may have crashed or be unresponsive. systemctl --user restart llama-backend.service"
+
+      # Long swap — model swap taking longer than 60s.
+      - alert: LlamaRouterLongSwap
+        expr: histogram_quantile(0.95, sum by (le, model_name) (rate(llama_router_swap_duration_seconds_bucket[10m]))) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model swap taking longer than 60s"
+          description: "p95 swap duration for model {{ $labels.model_name }} exceeds 60s. Either VRAM pressure or the backend is taking too long to load."

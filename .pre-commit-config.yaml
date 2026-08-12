@@ -1,0 +1,28 @@
+# .pre-commit-config.yaml — enforce shellcheck + pytest on every commit.
+#
+# Install with:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually with:
+#   pre-commit run --all-files
+#
+# Each hook fails the commit if the underlying check fails. CI also runs these
+# checks, but catching them at commit time saves a round trip.
+repos:
+  - repo: local
+    hooks:
+      - id: shellcheck
+        name: shellcheck
+        description: Lint all bash scripts with shellcheck.
+        language: system
+        entry: bash -c 'find . -name "*.sh" -not -path "./.venv/*" -not -path "./.git/*" -exec shellcheck {} +'
+        pass_filenames: false
+        types: [shell]
+      - id: pytest
+        name: pytest
+        description: Run the test suite with coverage enforcement.
+        language: system
+        entry: bash -c 'PYTHONPATH=src python3 -m pytest tests/ --cov=llama_bare --cov-branch --cov-fail-under=100 -q'
+        pass_filenames: false
+        stages: [manual]  # don't run pytest on every commit (too slow); run with `pre-commit run --hook-stage manual pytest`

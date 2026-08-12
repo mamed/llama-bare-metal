@@ -5,11 +5,11 @@ Wants=llama-backend.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/fekry/llama-bare-metal
-Environment=MODELS_YAML=/home/fekry/llama-cpp-docker/llama-unified/models.yaml
-Environment=ENV_FILE=/home/fekry/llama-bare-metal/.env
+WorkingDirectory=/home/fekry/Projects/llama-bare-metal
+Environment=MODELS_YAML=/home/fekry/Projects/llama-cpp-unified/models.yaml
+Environment=ENV_FILE=/home/fekry/Projects/llama-bare-metal/.env
 Environment=BACKEND_SERVICE=llama-backend.service
-ExecStart=/usr/bin/python3 /home/fekry/llama-bare-metal/llama-router.py
+ExecStart=/usr/bin/python3 /home/fekry/Projects/llama-bare-metal/llama-router.py
 Restart=on-failure
 RestartSec=5
 

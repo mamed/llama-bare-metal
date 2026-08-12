@@ -16,6 +16,12 @@
 
 set -eo pipefail
 
+# D2: Structured logging. Three levels, all emit to stderr with timestamps so
+# the systemd journal captures them. Use these instead of bare `echo`/`>&2`.
+log_info()  { printf '%s INFO: %s\n'  "$(date -Iseconds)" "$*" >&2; }
+log_warn()  { printf '%s WARN: %s\n'  "$(date -Iseconds)" "$*" >&2; }
+log_error() { printf '%s ERROR: %s\n' "$(date -Iseconds)" "$*" >&2; }
+
 # Source the perf env (CUDA or Vulkan, whichever baked it)
 # Use a subshell with -u disabled because some profile.d scripts (e.g.
 # cedilla-portuguese.sh on Ubuntu 26.04) reference unbound vars.
@@ -30,14 +36,43 @@ LLAMA_BARE_SRC="${LLAMA_BARE_SRC:-/home/fekry/Projects/llama-bare-metal/src}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/home/fekry/bin/llama-server-bare/llama-server}"
 
 if [[ ! -f "$CONFIG" ]]; then
-    echo "FATAL: config not found at $CONFIG" >&2
-    echo "Set CONFIG_FILE to point at a valid models.yaml" >&2
+    log_error "FATAL: config not found at $CONFIG"
+    log_error "Set CONFIG_FILE to point at a valid models.yaml"
     exit 1
 fi
 
 if [[ -z "${MODEL_NAME:-}" ]]; then
-    echo "FATAL: MODEL_NAME env var is required (set it in .env)" >&2
+    log_error "FATAL: MODEL_NAME env var is required (set it in .env)"
     exit 1
+fi
+
+# E5: Pre-flight binary check — fail fast with a clear error if the binary
+# is missing or not executable, instead of letting `exec` produce a cryptic
+# "exec format error" or "permission denied".
+if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
+    if [[ -e "$LLAMA_SERVER_BIN" ]]; then
+        log_error "FATAL: llama-server binary at $LLAMA_SERVER_BIN is not executable (check permissions)"
+    else
+        log_error "FATAL: llama-server binary not found at $LLAMA_SERVER_BIN"
+        log_error "Set LLAMA_SERVER_BIN to point at the llama-server executable, or build llama.cpp"
+    fi
+    exit 3
+fi
+
+# E7: Pre-flight GPU check — fail fast with exit 4 if nvidia-smi is broken
+# or returns no devices. Set DISABLE_GPU_CHECK=true to bypass.
+if [[ "${DISABLE_GPU_CHECK:-}" != "true" ]]; then
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_error "FATAL: nvidia-smi not found — GPU driver not installed?"
+        log_error "Set DISABLE_GPU_CHECK=true to bypass this check"
+        exit 4
+    fi
+    if ! nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q .; then
+        log_error "FATAL: nvidia-smi returned no GPUs — CUDA may be misconfigured"
+        log_error "Set DISABLE_GPU_CHECK=true to bypass this check"
+        exit 4
+    fi
+    log_info "GPU check passed: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 fi
 
 PORT="${PORT:-64000}"
@@ -145,12 +180,12 @@ mapfile -t ARGS < <(read_args)
 RC=$?
 
 if [[ $RC -ne 0 ]]; then
-    echo "FATAL: build_args failed (exit $RC)" >&2
+    log_error "FATAL: build_args failed (exit $RC)"
     exit "$RC"
 fi
 
-echo "--- launcher: loaded config for MODEL_NAME=$MODEL_NAME ---"
-printf '  %s\n' "${ARGS[@]}"
+log_info "--- launcher: loaded config for MODEL_NAME=$MODEL_NAME ---"
+printf '  %s\n' "${ARGS[@]}" >&2
 
-echo "--- launcher: exec llama-server ---"
+log_info "--- launcher: exec llama-server ---"
 exec "$LLAMA_SERVER_BIN" "${ARGS[@]}"

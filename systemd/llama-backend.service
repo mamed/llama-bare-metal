@@ -16,6 +16,15 @@ ExecStop=/bin/rm -f %t/llama-backend.model
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
+# E2: Watchdog — if llama-server hasn't sent a watchdog keepalive within
+# 300 seconds, systemd SIGKILLs the unit. llama-server doesn't natively
+# ping the watchdog, so this is a backstop for catastrophic hangs.
+# Set WATCHDOG_USEC=1 in the environment to enable.
+WatchdogTimeoutSec=300
+# E4: Rate-limit restart attempts — max 5 restarts in any 5-minute window.
+# After exhausting, `systemctl status` shows "failed" not "auto-restart".
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 # NVIDIA — make GPU visible. Same shape the Docker container used.
 Environment=NVIDIA_VISIBLE_DEVICES=all

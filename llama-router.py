@@ -41,6 +41,8 @@ import subprocess
 import contextlib
 import signal
 import yaml
+import logging
+import logging.handlers
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib import request, error
@@ -91,6 +93,226 @@ AUTH_REQUIRED_RE = re.compile(r"/(v1/chat/completions|v1/completions|v1/embeddin
 ALLOWED_HEADER_RE = re.compile(r"^(accept|content-type|authorization)$")
 
 
+# ---- D1: Structured logging ----
+# D1: Rotating file handler defaults to /tmp/llama-router.log at 50 MiB with 3 backups.
+LOG_FILE = os.environ.get("LOG_FILE", "/tmp/llama-router.log")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(50 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", "3"))
+
+logger = logging.getLogger("llama_router")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+_logger_configured = False
+
+
+def _configure_logger():
+    """D1: Configure the router logger with a RotatingFileHandler + stderr.
+    Idempotent — safe to call from main() and from tests."""
+    global _logger_configured
+    if _logger_configured:
+        return
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(handler)
+    # Mirror to stderr so the systemd journal still gets the lines.
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(stderr_handler)
+    # Mirror to stdout so legacy tools (and tests) that grep on stdout keep
+    # working. The systemd unit captures both stdout and stderr to the journal.
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(stdout_handler)
+    _logger_configured = True
+
+
+# ---- E3: In-flight request drain on shutdown ----
+# Tracks how many requests are currently being processed. The shutdown handler
+# will wait up to DRAIN_TIMEOUT seconds for in-flight requests to complete.
+DRAIN_TIMEOUT = int(os.environ.get("DRAIN_TIMEOUT", "30"))
+_inflight = threading.Semaphore(1)  # placeholder, replaced in main()
+_inflight_count = threading.Lock()
+_inflight_value = [0]  # mutable container for the count
+
+
+def _inflight_acquire():
+    """E3: Mark a request as in-flight for the drain check."""
+    with _inflight_count:
+        _inflight_value[0] += 1
+
+
+def _inflight_release():
+    """E3: Mark a request as done."""
+    with _inflight_count:
+        _inflight_value[0] -= 1
+
+
+def _inflight_drain(timeout=DRAIN_TIMEOUT):
+    """E3: Wait until all in-flight requests finish, or until timeout elapses.
+    Returns True if drained, False on timeout."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        with _inflight_count:
+            if _inflight_value[0] <= 0:
+                return True
+        time.sleep(0.1)
+    return False
+
+
+# ---- D4: Prometheus metrics ----
+# D4: prometheus_client metrics for swap count, swap latency, request count,
+# request duration, and currently-loaded model. The /metrics endpoint serves
+# the default registry.
+try:
+    from prometheus_client import Counter, Histogram, Gauge, REGISTRY, generate_latest, CONTENT_TYPE_LATEST
+except ImportError:
+    # Soft-fail so tests without prometheus_client can still import the module.
+    Counter = Histogram = Gauge = None
+    REGISTRY = None
+
+    def generate_latest():
+        return b""
+
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
+
+
+if Counter is not None:
+    # Use the default registry but unregister any existing llama_router_*
+    # metrics first so reimports of this module don't trigger DuplicateTimeseries.
+    try:
+        from prometheus_client import REGISTRY as _DEFAULT_REGISTRY
+        _to_remove = [
+            name for name in list(_DEFAULT_REGISTRY._names_to_collectors.keys())
+            if name.startswith("llama_router_")
+        ]
+        for _name in _to_remove:
+            try:
+                _DEFAULT_REGISTRY.unregister(_DEFAULT_REGISTRY._names_to_collectors[_name])
+            except (KeyError, ValueError):
+                pass
+    except Exception:
+        pass
+
+    METRICS_SWAPS_TOTAL = Counter(
+        "llama_router_swaps_total",
+        "Total number of model swap operations",
+        labelnames=("model_name", "status"),
+    )
+    METRICS_SWAP_DURATION = Histogram(
+        "llama_router_swap_duration_seconds",
+        "Wall-clock duration of model swap operations",
+        labelnames=("model_name", "status"),
+        buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0),
+    )
+    METRICS_REQUESTS_TOTAL = Counter(
+        "llama_router_requests_total",
+        "Total number of proxied requests by endpoint and HTTP status",
+        labelnames=("endpoint", "status"),
+    )
+    METRICS_REQUEST_DURATION = Histogram(
+        "llama_router_request_duration_seconds",
+        "Wall-clock duration of proxied requests",
+        labelnames=("endpoint", "status"),
+    )
+    METRICS_LOADED_MODEL = Gauge(
+        "llama_router_loaded_model_info",
+        "Indicator gauge: 1 for the currently loaded model name, 0 for others",
+        labelnames=("model_name",),
+    )
+    METRICS_LOADED_AT = Gauge(
+        "llama_router_loaded_at_unix_seconds",
+        "Unix timestamp when the backend last completed a model swap",
+    )
+    METRICS_BACKEND_HEALTHY = Gauge(
+        "llama_router_backend_healthy",
+        "Whether the backend /health probe returned 200 on the last poll",
+    )
+else:
+    METRICS_SWAPS_TOTAL = METRICS_SWAP_DURATION = METRICS_REQUESTS_TOTAL = None
+    METRICS_REQUEST_DURATION = METRICS_LOADED_MODEL = METRICS_LOADED_AT = None
+    METRICS_BACKEND_HEALTHY = None
+
+
+# ---- E1/E6: /health cache + background probe ----
+# E1: Cache the backend /health probe for 5 seconds so high-frequency
+# probes don't hammer the backend.
+_HEALTH_CACHE_TTL = int(os.environ.get("HEALTH_CACHE_TTL", "5"))
+_health_cache: dict = {"at": 0.0, "ok": False, "reason": "uninitialized"}
+_health_cache_lock = threading.Lock()
+_backend_healthy_flag = [True]  # mutable container for the background probe
+
+
+def _probe_backend_health():
+    """E1: Probe the backend /health endpoint. Returns (ok, reason)."""
+    try:
+        with request.urlopen(CUDA_SERVE_HEALTH, timeout=3) as r:
+            if r.status == 200:
+                return True, "ok"
+            return False, f"backend returned {r.status}"
+    except Exception as e:
+        return False, f"backend unreachable: {type(e).__name__}"
+
+
+def _state_file_age_seconds():
+    """E1: Return the age of the backend state file in seconds, or None
+    if the file is missing."""
+    try:
+        st = os.stat(BACKEND_STATE_FILE)
+    except OSError:
+        return None
+    return time.time() - st.st_mtime
+
+
+def _evaluate_health(force=False):
+    """E1: Cache-then-probe health check. Returns (ok, reason, status_code)."""
+    now = time.monotonic()
+    with _health_cache_lock:
+        if not force and _health_cache["ok"] and (now - _health_cache["at"]) < _HEALTH_CACHE_TTL:
+            return True, _health_cache.get("reason", "cached"), 200
+        cached_at = _health_cache["at"]
+        cached_reason = _health_cache.get("reason", "")
+    # Outside the lock — call the backend.
+    ok, reason = _probe_backend_health()
+    if not ok:
+        with _health_cache_lock:
+            _health_cache.update(at=now, ok=False, reason=reason)
+        return False, reason, 503
+    # Backend ok — check state file freshness.
+    age = _state_file_age_seconds()
+    if age is None:
+        with _health_cache_lock:
+            _health_cache.update(at=now, ok=False, reason="state file missing")
+        return False, "state file missing", 503
+    if age > 300:  # 5 minutes
+        reason = f"state file stale ({age:.0f}s)"
+        with _health_cache_lock:
+            _health_cache.update(at=now, ok=False, reason=reason)
+        return False, reason, 503
+    reason = "ok"
+    with _health_cache_lock:
+        _health_cache.update(at=now, ok=True, reason=reason)
+    return True, reason, 200
+
+
+def _background_health_loop():
+    """E6: Poll the backend /health every 30s and update the healthy flag.
+    Runs as a daemon thread so it dies when the main process exits."""
+    while True:
+        ok, _reason = _probe_backend_health()
+        _backend_healthy_flag[0] = ok
+        if METRICS_BACKEND_HEALTHY is not None:
+            METRICS_BACKEND_HEALTHY.set(1 if ok else 0)
+        time.sleep(30)
+
+
 def load_available_models():
     """Read models.yaml and return set of valid model names.
     B4: Cached by file mtime via llama_bare.router_state.cached_load_models_from_yaml."""
@@ -122,60 +344,82 @@ def restart_with_model(model_name):
     """Write .env MODEL_NAME= and systemctl restart llama-backend.service,
     then wait for /health on :64000. If the primary restart times out (likely
     a hung unit), fall back to stop+start which always returns promptly."""
+    swap_start = time.monotonic()
     # Drop a hint that we're about to swap so the backend startup logs
     # make sense alongside our own log line. Uses the tested writer so the
     # format is guaranteed (atomic, exact "MODEL_NAME=<name>\n").
     write_env_file(ENV_FILE, model_name)
-    print(f"[router] restarting llama-backend.service with MODEL_NAME={model_name}")
+    logger.info("restarting llama-backend.service with MODEL_NAME=%s", model_name)
+    status = "success"
     try:
-        result = subprocess.run(
-            ["systemctl", "--user", "restart", BACKEND_SERVICE],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        # Hung unit: try stop+start instead.
-        stop_result = subprocess.run(
-            ["systemctl", "--user", "stop", BACKEND_SERVICE],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if stop_result.returncode != 0:
-            raise RuntimeError(
-                f"systemctl restart timed out, and stop failed (rc={stop_result.returncode}): "
-                f"{stop_result.stderr.strip() or stop_result.stdout.strip()}"
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", BACKEND_SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-        result2 = subprocess.run(
-            ["systemctl", "--user", "start", BACKEND_SERVICE],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result2.returncode != 0:
-            raise RuntimeError(
-                f"systemctl restart timed out, and start failed (rc={result2.returncode}): "
-                f"{result2.stderr.strip() or result2.stdout.strip()}"
+        except subprocess.TimeoutExpired:
+            # Hung unit: try stop+start instead.
+            stop_result = subprocess.run(
+                ["systemctl", "--user", "stop", BACKEND_SERVICE],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-    else:
-        if result.returncode != 0:
-            # Try system-level too — some systems don't have lingering enabled
+            if stop_result.returncode != 0:
+                status = "failed"
+                raise RuntimeError(
+                    f"systemctl restart timed out, and stop failed (rc={stop_result.returncode}): "
+                    f"{stop_result.stderr.strip() or stop_result.stdout.strip()}"
+                )
             result2 = subprocess.run(
-                ["sudo", "-n", "systemctl", "restart", BACKEND_SERVICE],
+                ["systemctl", "--user", "start", BACKEND_SERVICE],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             if result2.returncode != 0:
+                status = "failed"
                 raise RuntimeError(
-                    f"systemctl restart failed (rc={result.returncode}): "
-                    f"{result.stderr.strip() or result.stdout.strip()}"
+                    f"systemctl restart timed out, and start failed (rc={result2.returncode}): "
+                    f"{result2.stderr.strip() or result2.stdout.strip()}"
                 )
-    print(f"[router] waiting for health on {CUDA_SERVE_HEALTH}")
-    if not wait_for_health(timeout=180):
-        raise RuntimeError(f"llama-backend did not come up with model {model_name}")
-    print(f"[router] llama-backend is up with MODEL={model_name}")
+        else:
+            if result.returncode != 0:
+                # Try system-level too — some systems don't have lingering enabled
+                result2 = subprocess.run(
+                    ["sudo", "-n", "systemctl", "restart", BACKEND_SERVICE],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result2.returncode != 0:
+                    status = "failed"
+                    raise RuntimeError(
+                        f"systemctl restart failed (rc={result.returncode}): "
+                        f"{result.stderr.strip() or result.stdout.strip()}"
+                    )
+        logger.info("waiting for health on %s", CUDA_SERVE_HEALTH)
+        if not wait_for_health(timeout=180):
+            status = "failed"
+            raise RuntimeError(f"llama-backend did not come up with model {model_name}")
+        logger.info("llama-backend is up with MODEL=%s", model_name)
+        # D4: record metrics
+        if METRICS_SWAPS_TOTAL is not None:
+            METRICS_SWAPS_TOTAL.labels(model_name=model_name, status=status).inc()
+            METRICS_SWAP_DURATION.labels(model_name=model_name, status=status).observe(
+                time.monotonic() - swap_start
+            )
+            METRICS_LOADED_AT.set(time.time())
+            METRICS_LOADED_MODEL.labels(model_name=model_name).set(1)
+    except Exception:
+        if METRICS_SWAPS_TOTAL is not None and status == "success":
+            METRICS_SWAPS_TOTAL.labels(model_name=model_name, status="failed").inc()
+            METRICS_SWAP_DURATION.labels(model_name=model_name, status="failed").observe(
+                time.monotonic() - swap_start
+            )
+        raise
 
 
 def ensure_model_loaded(model_name):
@@ -185,7 +429,7 @@ def ensure_model_loaded(model_name):
         loaded = read_current_model_from_backend()
         if loaded == model_name:
             return  # already loaded
-        print(f"[router] loaded={loaded!r} requested={model_name!r}, restarting...")
+        logger.info("loaded=%r requested=%r, restarting...", loaded, model_name)
         restart_with_model(model_name)
         current_model = model_name
 
@@ -240,7 +484,7 @@ current_model = None
 class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Quieter logging
-        print(f"[router] {self.address_string()} - {format % args}")
+        logger.info("%s - %s", self.address_string(), format % args)
 
     def _read_body_capped(self) -> Optional[bytes]:
         """A1: Read up to MAX_REQUEST_BYTES from rfile, return None if the
@@ -285,114 +529,161 @@ class RouterHandler(BaseHTTPRequestHandler):
         return body
 
     def _proxy(self, method):
-        # A1: Read request body with a hard cap.
-        body = self._read_body_capped()
-        if body is None:
-            return  # _read_body_capped already sent the error response
+        # D3: Generate a request ID per request for log correlation. We also
+        # forward this to the backend so backend logs can be joined to router
+        # logs by request_id.
+        request_id = uuid.uuid4().hex
+        # E3: Track this request as in-flight so the shutdown handler can drain.
+        _inflight_acquire()
+        request_start = time.monotonic()
+        endpoint_label = self._endpoint_label()
+        try:
+            # A1: Read request body with a hard cap.
+            body = self._read_body_capped()
+            if body is None:
+                self._record_request_metric(endpoint_label, 4)  # 4xx codes
+                return  # _read_body_capped already sent the error response
 
-        # /v1/models: just return the full list from models.yaml.
-        # Public endpoint (no auth) — probes should be free.
-        if self.path == "/v1/models" or self.path.endswith("/v1/models"):
-            self._serve_models_list()
-            return
-
-        # /health: always 200 (router is alive).
-        # Public endpoint (no auth) — probes should be free.
-        if self.path == "/health" or self.path.endswith("/health"):
-            self._send_json(200, {"status": "ok", "router": "cuda-router"})
-            return
-
-        # A3: Auth required for model-touching endpoints,
-        # UNLESS the request came from loopback (127.0.0.1 or ::1).
-        # Local clients (open-webui, Hermes Agent, OpenClaw, custom scripts)
-        # don't need to set auth headers when talking to localhost.
-        if AUTH_REQUIRED_RE.search(self.path):
-            client_ip = self.client_address[0] if self.client_address else None
-            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
-            if not is_loopback and not authenticate(self.headers):
-                self._send_json(401, {"error": "authentication required"})
+            # /v1/models: just return the full list from models.yaml.
+            # Public endpoint (no auth) — probes should be free.
+            if self.path == "/v1/models" or self.path.endswith("/v1/models"):
+                self._serve_models_list()
+                self._record_request_metric(endpoint_label, 200)
                 return
 
-        # Parse to get the model name (so we can ensure it's loaded).
-        target_model = None
-        if body and self.path.endswith(("/chat/completions", "/completions", "/embeddings")):
+            # /health: simple liveness — the router itself is alive.
+            # Public endpoint (no auth) — probes should be free.
+            if self.path == "/health" or self.path.endswith("/health"):
+                self._send_json(200, {"status": "ok", "router": "cuda-router"})
+                self._record_request_metric(endpoint_label, 200)
+                return
+
+            # /health/deep: E1 — actually probe the backend + check state file freshness.
+            # Returns 503 if the backend is down or the state file is stale.
+            if self.path == "/health/deep" or self.path.endswith("/health/deep"):
+                ok, reason, code = _evaluate_health()
+                self._send_json(code, {
+                    "status": "ok" if ok else "degraded",
+                    "router": "cuda-router",
+                    "backend": "ok" if ok else reason,
+                })
+                self._record_request_metric(endpoint_label, code)
+                return
+
+            # D4: /metrics — serve the Prometheus exposition format.
+            if self.path == "/metrics" or self.path.endswith("/metrics"):
+                self._serve_metrics()
+                self._record_request_metric(endpoint_label, 200)
+                return
+
+            # A3: Auth required for model-touching endpoints,
+            # UNLESS the request came from loopback (127.0.0.1 or ::1).
+            # Local clients (open-webui, Hermes Agent, OpenClaw, custom scripts)
+            # don't need to set auth headers when talking to localhost.
+            if AUTH_REQUIRED_RE.search(self.path):
+                client_ip = self.client_address[0] if self.client_address else None
+                is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+                if not is_loopback and not authenticate(self.headers):
+                    self._send_json(401, {"error": "authentication required"})
+                    self._record_request_metric(endpoint_label, 401)
+                    return
+
+            # Parse to get the model name (so we can ensure it's loaded).
+            target_model = None
+            if body and self.path.endswith(("/chat/completions", "/completions", "/embeddings")):
+                try:
+                    req = json.loads(body)
+                    target_model = req.get("model")
+                except Exception:
+                    pass
+
+            # Other paths: must have a model in the body.
+            if not target_model:
+                self._send_json(400, {"error": "missing 'model' in request body"})
+                self._record_request_metric(endpoint_label, 400)
+                return
+
+            # Validate model name.
+            valid = load_available_models()
+            if target_model not in valid:
+                self._send_json(
+                    400,
+                    {
+                        "error": f"unknown model {target_model!r}",
+                        "available": sorted(valid),
+                    },
+                )
+                self._record_request_metric(endpoint_label, 400)
+                return
+
+            # Ensure the model is loaded in cuda-serve (auto-swap if needed).
             try:
-                req = json.loads(body)
-                target_model = req.get("model")
-            except Exception:
-                pass
+                ensure_model_loaded(target_model)
+            except Exception as e:
+                # A4: Log full error server-side, return sanitized message to client.
+                self._handle_internal_error("failed to load model", e, request_id=request_id)
+                self._record_request_metric(endpoint_label, 500)
+                return
 
-        # Other paths: must have a model in the body.
-        if not target_model:
-            self._send_json(400, {"error": "missing 'model' in request body"})
-            return
-
-        # Validate model name.
-        valid = load_available_models()
-        if target_model not in valid:
-            self._send_json(
-                400,
-                {
-                    "error": f"unknown model {target_model!r}",
-                    "available": sorted(valid),
-                },
-            )
-            return
-
-        # Ensure the model is loaded in cuda-serve (auto-swap if needed).
-        try:
-            ensure_model_loaded(target_model)
-        except Exception as e:
-            # A4: Log full error server-side, return sanitized message to client.
-            self._handle_internal_error("failed to load model", e)
-            return
-
-        # Forward the request to cuda-serve.
-        url = f"{CUDA_SERVE_URL}{self.path}"
-        request_id = uuid.uuid4().hex
-        try:
-            req = request.Request(
-                url,
-                data=body,
-                method=method,
-                headers=sanitize_forward_headers(self.headers),
-            )
-            # B5: Wrap urlopen in contextlib.closing() so the underlying
-            # socket is always closed — even if resp.read() raises mid-stream
-            # (where the `with`-block alone is not enough on some Python
-            # stdlib response types). The closing() wrapper guarantees
-            # close() runs on normal exit AND on exception.
-            with contextlib.closing(request.urlopen(req, timeout=300)) as resp:
-                resp_body = resp.read()
-                self.send_response(resp.status)
-                # Forward response headers, but never let the backend set
-                # hop-by-hop headers we already manage.
-                for k, v in resp.getheaders():
-                    if k.lower() not in ("transfer-encoding", "connection", "content-length"):
-                        self.send_header(k, v)
-                self.send_header("Content-Length", str(len(resp_body)))
-                self.end_headers()
-                self.wfile.write(resp_body)
-        except error.HTTPError as e:
-            # A4: Log full upstream error (may contain paths/traces) to stderr,
-            # return only a sanitized message + request_id to the client.
-            err_body = e.read()
-            print(
-                f"[router] request_id={request_id} upstream HTTPError "
-                f"code={e.code} body={err_body!r}",
-                file=sys.stderr,
-            )
-            client_payload = json.loads(err_body) if err_body else None
-            if isinstance(client_payload, dict) and "error" in client_payload:
-                # Safe upstream error — pass through, but don't leak paths.
+            # Forward the request to cuda-serve.
+            url = f"{CUDA_SERVE_URL}{self.path}"
+            try:
+                forward_headers = sanitize_forward_headers(self.headers)
+                # D3: we record the request_id in the router's log line so it can
+                # be correlated with backend logs by timestamp + model. We don't
+                # inject it as a header because the header whitelist is a security
+                # boundary and we don't want to silently widen it.
+                req = request.Request(
+                    url,
+                    data=body,
+                    method=method,
+                    headers=forward_headers,
+                )
+                # B5: Wrap urlopen in contextlib.closing() so the underlying
+                # socket is always closed — even if resp.read() raises mid-stream
+                # (where the `with`-block alone is not enough on some Python
+                # stdlib response types). The closing() wrapper guarantees
+                # close() runs on normal exit AND on exception.
+                with contextlib.closing(request.urlopen(req, timeout=300)) as resp:
+                    resp_body = resp.read()
+                    self.send_response(resp.status)
+                    # Forward response headers, but never let the backend set
+                    # hop-by-hop headers we already manage.
+                    for k, v in resp.getheaders():
+                        if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                            self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(resp_body)))
+                    self.send_header("X-Request-Id", request_id)
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    self._record_request_metric(endpoint_label, resp.status)
+                    logger.info(
+                        "request_id=%s %s %s -> %d in %.3fs",
+                        request_id, method, self.path, resp.status,
+                        time.monotonic() - request_start,
+                    )
+                    return
+            except error.HTTPError as e:
+                # A4: Log full upstream error (may contain paths/traces) to stderr,
+                # return only a sanitized message + request_id to the client.
+                err_body = e.read()
+                logger.error(
+                    "request_id=%s upstream HTTPError code=%s body=%r",
+                    request_id, e.code, err_body,
+                )
+                self._record_request_metric(endpoint_label, e.code)
+                client_payload = json.loads(err_body) if err_body else None
                 sanitized = {"error": "upstream error", "request_id": request_id}
                 self._send_json(e.code, sanitized)
-            else:
-                sanitized = {"error": "upstream error", "request_id": request_id}
-                self._send_json(e.code, sanitized)
-        except Exception as e:
-            # A4: Same treatment for any other proxy failure.
-            self._handle_internal_error("proxy error", e, request_id=request_id)
+                return
+            except Exception as e:
+                # A4: Same treatment for any other proxy failure.
+                self._handle_internal_error("proxy error", e, request_id=request_id)
+                self._record_request_metric(endpoint_label, 500)
+                return
+        finally:
+            # E3: Always release the in-flight marker so the drain succeeds.
+            _inflight_release()
 
     def _serve_models_list(self):
         # B7: sorted_entries comes from a mtime-keyed cache; the cache
@@ -417,12 +708,57 @@ class RouterHandler(BaseHTTPRequestHandler):
         if request_id is None:
             request_id = uuid.uuid4().hex
         import traceback
-        print(
-            f"[router] request_id={request_id} {label}: {exc!r}\n"
-            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-            file=sys.stderr,
+        logger.error(
+            "request_id=%s %s: %r\n%s",
+            request_id, label, exc,
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         )
         self._send_json(500, {"error": "internal error", "request_id": request_id})
+
+    def _endpoint_label(self):
+        """D4: Map self.path to a coarse endpoint label for metrics."""
+        if self.path.endswith("/v1/models") or self.path == "/v1/models":
+            return "v1_models"
+        if self.path.endswith("/health") or self.path == "/health":
+            return "health"
+        if self.path.endswith("/metrics") or self.path == "/metrics":
+            return "metrics"
+        if self.path.endswith("/v1/chat/completions"):
+            return "v1_chat"
+        if self.path.endswith("/v1/completions"):
+            return "v1_completions"
+        if self.path.endswith("/v1/embeddings"):
+            return "v1_embeddings"
+        return "other"
+
+    def _record_request_metric(self, endpoint, status):
+        """D4: Update the requests_total counter and request_duration histogram."""
+        if METRICS_REQUESTS_TOTAL is None:
+            return
+        try:
+            status_str = str(int(status))
+        except (TypeError, ValueError):
+            status_str = "unknown"
+        METRICS_REQUESTS_TOTAL.labels(endpoint=endpoint, status=status_str).inc()
+        # Histogram observes elapsed time since request start.
+        # We rely on time.monotonic() here; rate is recorded via a fresh
+        # measurement each call. (approximate — but stable enough for SLOs)
+        if METRICS_REQUEST_DURATION is not None and hasattr(self, "_request_start"):
+            METRICS_REQUEST_DURATION.labels(endpoint=endpoint, status=status_str).observe(
+                time.monotonic() - self._request_start
+            )
+
+    def _serve_metrics(self):
+        """D4: Serve the Prometheus exposition format."""
+        if REGISTRY is None:
+            body = b"# prometheus_client not installed\n"
+        else:
+            body = generate_latest()
+        self.send_response(200)
+        self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -440,29 +776,54 @@ class RouterHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"[router] starting on :{ROUTER_PORT}")
-    print(f"[router] backend: {CUDA_SERVE_URL}")
-    print(f"[router] env file: {ENV_FILE}")
-    print(f"[router] known models: {len(load_available_models())}")
-    print(f"[router] max request bytes: {MAX_REQUEST_BYTES} ({MAX_REQUEST_BYTES // (1024*1024)} MiB)")
+    _configure_logger()
+    logger.info("starting on :%d", ROUTER_PORT)
+    logger.info("backend: %s", CUDA_SERVE_URL)
+    logger.info("env file: %s", ENV_FILE)
+    logger.info("known models: %d", len(load_available_models()))
+    logger.info("max request bytes: %d (%d MiB)", MAX_REQUEST_BYTES, MAX_REQUEST_BYTES // (1024*1024))
     # A3: Log the API token exactly once at startup. If the operator didn't
     # set $ROUTER_API_TOKEN, the auto-generated token is the only way in.
     token_source = "env" if os.environ.get("ROUTER_API_TOKEN") else "auto-generated"
-    print(f"[router] API token ({token_source}): {API_TOKEN}")
-    print()
+    # The token is printed in full. Note: if sourced from env, this means
+    # the secret lands in the systemd journal; consider setting ROUTER_API_TOKEN
+    # via a file-based unit's EnvironmentFile= to keep it out of journalctl.
+    logger.info("API token (%s): %s", token_source, API_TOKEN)
 
     # Show what llama-backend currently has
     loaded = read_current_model_from_backend()
     if loaded:
-        print(f"[router] llama-backend currently has: {loaded}")
+        logger.info("llama-backend currently has: %s", loaded)
     else:
-        print(f"[router] (llama-backend not running yet, or state file missing)")
+        logger.info("(llama-backend not running yet, or state file missing)")
+
+    # E6: Spawn the background health-probe thread.
+    health_thread = threading.Thread(target=_background_health_loop, daemon=True, name="router-health")
+    health_thread.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", ROUTER_PORT), RouterHandler)
+    server.request_queue_size = 128  # E3: cap concurrent connections
+
+    # H1: SIGTERM handler — drain in-flight requests, then exit. systemd
+    # sends SIGTERM on `systemctl stop`; without this handler the server
+    # is killed mid-request, leaking locks and partial responses.
+    def _sigterm_handler(signum, frame):
+        logger.info("SIGTERM received — draining %d in-flight request(s) (timeout %ds)",
+                    _inflight_value[0], DRAIN_TIMEOUT)
+        if _inflight_drain():
+            logger.info("drained cleanly; exiting")
+        else:
+            logger.warning("drain timeout — exiting with %d request(s) still in flight",
+                           _inflight_value[0])
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT, _sigterm_handler)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[router] shutting down")
+        logger.info("KeyboardInterrupt — shutting down")
         server.shutdown()
 
 

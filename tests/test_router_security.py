@@ -271,7 +271,7 @@ def test_header_whitelist_blocks_x_forwarded(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -319,7 +319,7 @@ def test_header_whitelist_blocks_host(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -464,7 +464,7 @@ def test_auth_accepts_authorization_bearer(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -494,7 +494,7 @@ def test_auth_accepts_x_api_token(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -596,7 +596,7 @@ def test_error_messages_no_path_leak(router_default, monkeypatch):
                         io.BytesIO(upstream_body))
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -636,7 +636,7 @@ def test_error_messages_log_full_to_stderr(router_default, monkeypatch, capfd):
                         io.BytesIO(upstream_body))
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -675,7 +675,7 @@ def test_proxy_strips_connection_header(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -713,7 +713,7 @@ def test_proxy_adds_x_router_forwarded(router_default, monkeypatch):
         return _FakeUrlOpenResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     # Client sends zero headers (other than auth).
@@ -789,7 +789,7 @@ def test_urlopen_response_closed_on_exception(router_default, monkeypatch):
         return _LeakyResponse()
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -824,7 +824,7 @@ def test_urlopen_timeout_propagates_from_urlopen_call(router_default, monkeypatc
         raise TimeoutError(f"connect timeout after {timeout}s")
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -855,7 +855,7 @@ def test_proxy_uses_urlopen_timeout_300(router_default, monkeypatch):
         return _FakeUrlOpenResponse(body=b"{}", status=200, headers=[])
 
     monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m"}'
@@ -1002,7 +1002,7 @@ def test_router_chat_completions_with_connection_close_returns_immediately(
     import time
 
     # Stub everything downstream so the test exercises ONLY the body read.
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     def fake_urlopen(req, timeout=None):
@@ -1045,7 +1045,7 @@ def test_router_chat_completions_with_keep_alive_returns_immediately(
     return within 1s — the probe was wrong on every path, not just close."""
     import time
 
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     def fake_urlopen(req, timeout=None):
@@ -1081,7 +1081,7 @@ def test_router_no_hang_on_small_body(router_default, monkeypatch):
     """PHASE G #3: Small (~200 byte) body — must respond in <1s."""
     import time
 
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     def fake_urlopen(req, timeout=None):
@@ -1125,7 +1125,7 @@ def test_router_no_hang_on_large_body(router_default, monkeypatch):
     parse. The point is to assert NO HANG, regardless of status code."""
     import time
 
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     def fake_urlopen(req, timeout=None):
@@ -1165,7 +1165,7 @@ def test_router_no_hang_on_oversized_body(router_default, monkeypatch):
     so this should be instant."""
     import time
 
-    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
 
     declared = 35 * 1024 * 1024
@@ -1224,7 +1224,7 @@ def test_read_body_capped_no_probe(router_default):
 def _stub_loopback_forward(mod, monkeypatch):
     """Common stubs for the loopback-bypass tests so each test only has to
     assert on the response code — not on the proxy plumbing."""
-    monkeypatch.setattr(mod, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(mod, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(mod, "load_available_models", lambda: {"m"})
 
     def fake_urlopen(req, timeout=None):

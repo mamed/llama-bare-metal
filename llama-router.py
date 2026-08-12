@@ -138,9 +138,18 @@ def _configure_logger():
 # Tracks how many requests are currently being processed. The shutdown handler
 # will wait up to DRAIN_TIMEOUT seconds for in-flight requests to complete.
 DRAIN_TIMEOUT = int(os.environ.get("DRAIN_TIMEOUT", "30"))
-_inflight = threading.Semaphore(1)  # placeholder, replaced in main()
 _inflight_count = threading.Lock()
 _inflight_value = [0]  # mutable container for the count
+
+# ---- L-3: Exponential backoff on failed swaps ----
+# A hot loop on a broken backend will hammer `systemctl restart`
+# continuously. Count consecutive failures and back off (2s, 4s, 8s, ...,
+# capped at SWAP_BACKOFF_MAX seconds). Reset on a successful swap.
+SWAP_BACKOFF_INITIAL = 2.0  # seconds; doubles each failure
+SWAP_BACKOFF_MAX = 60.0  # ceiling
+_swap_failure_count = 0
+_next_swap_allowed_at = 0.0  # time.monotonic() when next swap is allowed
+_swap_backoff_lock = threading.Lock()
 
 
 def _inflight_acquire():
@@ -185,56 +194,55 @@ except ImportError:
 
 
 if Counter is not None:
-    # Use the default registry but unregister any existing llama_router_*
-    # metrics first so reimports of this module don't trigger DuplicateTimeseries.
-    try:
-        from prometheus_client import REGISTRY as _DEFAULT_REGISTRY
-        _to_remove = [
-            name for name in list(_DEFAULT_REGISTRY._names_to_collectors.keys())
-            if name.startswith("llama_router_")
-        ]
-        for _name in _to_remove:
-            try:
-                _DEFAULT_REGISTRY.unregister(_DEFAULT_REGISTRY._names_to_collectors[_name])
-            except (KeyError, ValueError):
-                pass
-    except Exception:
-        pass
-
-    METRICS_SWAPS_TOTAL = Counter(
-        "llama_router_swaps_total",
-        "Total number of model swap operations",
-        labelnames=("model_name", "status"),
-    )
-    METRICS_SWAP_DURATION = Histogram(
-        "llama_router_swap_duration_seconds",
-        "Wall-clock duration of model swap operations",
-        labelnames=("model_name", "status"),
-        buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0),
-    )
-    METRICS_REQUESTS_TOTAL = Counter(
-        "llama_router_requests_total",
-        "Total number of proxied requests by endpoint and HTTP status",
-        labelnames=("endpoint", "status"),
-    )
-    METRICS_REQUEST_DURATION = Histogram(
-        "llama_router_request_duration_seconds",
-        "Wall-clock duration of proxied requests",
-        labelnames=("endpoint", "status"),
-    )
-    METRICS_LOADED_MODEL = Gauge(
-        "llama_router_loaded_model_info",
-        "Indicator gauge: 1 for the currently loaded model name, 0 for others",
-        labelnames=("model_name",),
-    )
-    METRICS_LOADED_AT = Gauge(
-        "llama_router_loaded_at_unix_seconds",
-        "Unix timestamp when the backend last completed a model swap",
-    )
-    METRICS_BACKEND_HEALTHY = Gauge(
-        "llama_router_backend_healthy",
-        "Whether the backend /health probe returned 200 on the last poll",
-    )
+    # L-5: Use the public Counter/Histogram/Gauge constructors; guard
+    # against double-registration in the same process (test reimports,
+    # `importlib.reload`). The previous code reached into the private
+    # `_names_to_collectors` dict — a module-level flag is the
+    # public-API equivalent. Subsequent imports in the same process
+    # reuse the names already bound at the top level.
+    if "METRICS_SWAPS_TOTAL" not in globals():
+        try:
+            METRICS_SWAPS_TOTAL = Counter(
+                "llama_router_swaps_total",
+                "Total number of model swap operations",
+                labelnames=("model_name", "status"),
+            )
+            METRICS_SWAP_DURATION = Histogram(
+                "llama_router_swap_duration_seconds",
+                "Wall-clock duration of model swap operations",
+                labelnames=("model_name", "status"),
+                buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0),
+            )
+            METRICS_REQUESTS_TOTAL = Counter(
+                "llama_router_requests_total",
+                "Total number of proxied requests by endpoint and HTTP status",
+                labelnames=("endpoint", "status"),
+            )
+            METRICS_REQUEST_DURATION = Histogram(
+                "llama_router_request_duration_seconds",
+                "Wall-clock duration of proxied requests",
+                labelnames=("endpoint", "status"),
+            )
+            METRICS_LOADED_MODEL = Gauge(
+                "llama_router_loaded_model_info",
+                "Indicator gauge: 1 for the currently loaded model name, 0 for others",
+                labelnames=("model_name",),
+            )
+            METRICS_LOADED_AT = Gauge(
+                "llama_router_loaded_at_unix_seconds",
+                "Unix timestamp when the backend last completed a model swap",
+            )
+            METRICS_BACKEND_HEALTHY = Gauge(
+                "llama_router_backend_healthy",
+                "Whether the backend /health probe returned 200 on the last poll",
+            )
+        except ValueError:
+            # Already registered in this process (DuplicateTimeseries).
+            # Disable all metrics so calls are no-ops.
+            METRICS_SWAPS_TOTAL = METRICS_SWAP_DURATION = None
+            METRICS_REQUESTS_TOTAL = METRICS_REQUEST_DURATION = None
+            METRICS_LOADED_MODEL = METRICS_LOADED_AT = None
+            METRICS_BACKEND_HEALTHY = None
 else:
     METRICS_SWAPS_TOTAL = METRICS_SWAP_DURATION = METRICS_REQUESTS_TOTAL = None
     METRICS_REQUEST_DURATION = METRICS_LOADED_MODEL = METRICS_LOADED_AT = None
@@ -343,7 +351,10 @@ def wait_for_health(timeout=120, interval=2):
 def restart_with_model(model_name):
     """Write .env MODEL_NAME= and systemctl restart llama-backend.service,
     then wait for /health on :64000. If the primary restart times out (likely
-    a hung unit), fall back to stop+start which always returns promptly."""
+    a hung unit), fall back to stop+start which always returns promptly.
+    L-3: On success, reset the swap-backoff counter. On failure, increment
+    the counter and push the next-allowed time forward exponentially."""
+    global _swap_failure_count, _next_swap_allowed_at
     swap_start = time.monotonic()
     # Drop a hint that we're about to swap so the backend startup logs
     # make sense alongside our own log line. Uses the tested writer so the
@@ -413,25 +424,54 @@ def restart_with_model(model_name):
             )
             METRICS_LOADED_AT.set(time.time())
             METRICS_LOADED_MODEL.labels(model_name=model_name).set(1)
+        # L-3: Success — reset backoff state.
+        with _swap_backoff_lock:
+            _swap_failure_count = 0
+            _next_swap_allowed_at = 0.0
     except Exception:
         if METRICS_SWAPS_TOTAL is not None and status == "success":
             METRICS_SWAPS_TOTAL.labels(model_name=model_name, status="failed").inc()
             METRICS_SWAP_DURATION.labels(model_name=model_name, status="failed").observe(
                 time.monotonic() - swap_start
             )
+        # L-3: Failure — increment backoff exponentially.
+        with _swap_backoff_lock:
+            _swap_failure_count += 1
+            backoff = min(
+                SWAP_BACKOFF_MAX,
+                SWAP_BACKOFF_INITIAL * (2 ** (_swap_failure_count - 1)),
+            )
+            _next_swap_allowed_at = time.monotonic() + backoff
+        logger.warning(
+            "swap failure #%d for MODEL=%s; next swap allowed in %.1fs",
+            _swap_failure_count, model_name, backoff,
+        )
         raise
 
 
 def ensure_model_loaded(model_name):
-    """If a different model is loaded, restart llama-backend with the requested one."""
+    """If a different model is loaded, restart llama-backend with the requested one.
+    L-3: If a recent swap failed, the module is in backoff — reject the request
+    with 503 + retry_after rather than hammering a broken backend."""
     global current_model
+    # L-3: Backoff gate. Checked BEFORE acquiring restart_lock so a request
+    # rejected by backoff doesn't block other swappers behind it.
+    with _swap_backoff_lock:
+        wait = _next_swap_allowed_at - time.monotonic()
+    if wait > 0:
+        logger.warning(
+            "swap to %r rejected: backend in backoff for %.1fs after recent failure",
+            model_name, wait,
+        )
+        return False, ("in_backoff", wait)
     with restart_lock:
         loaded = read_current_model_from_backend()
         if loaded == model_name:
-            return  # already loaded
+            return True, ("already_loaded", 0.0)
         logger.info("loaded=%r requested=%r, restarting...", loaded, model_name)
         restart_with_model(model_name)
         current_model = model_name
+        return True, ("swapped", 0.0)
 
 
 def extract_bearer_token(headers) -> Optional[str]:
@@ -618,7 +658,18 @@ class RouterHandler(BaseHTTPRequestHandler):
 
             # Ensure the model is loaded in cuda-serve (auto-swap if needed).
             try:
-                ensure_model_loaded(target_model)
+                ok, info = ensure_model_loaded(target_model)
+                if not ok:
+                    # L-3: Backend is in backoff after recent failures.
+                    # Return 503 + retry_after so the client can retry later
+                    # instead of hammering a broken backend.
+                    reason, retry_after = info
+                    self._send_json(503, {
+                        "error": "backend in backoff after recent failure",
+                        "retry_after": retry_after,
+                    })
+                    self._record_request_metric(endpoint_label, 503)
+                    return
             except Exception as e:
                 # A4: Log full error server-side, return sanitized message to client.
                 self._handle_internal_error("failed to load model", e, request_id=request_id)
@@ -655,7 +706,18 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(resp_body)))
                     self.send_header("X-Request-Id", request_id)
                     self.end_headers()
-                    self.wfile.write(resp_body)
+                    # L-4: Catch client-disconnect (BrokenPipeError /
+                    # ConnectionResetError) so a closed socket doesn't
+                    # propagate as an uncaught exception. The `finally`
+                    # still releases the in-flight counter.
+                    try:
+                        self.wfile.write(resp_body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        logger.info(
+                            "request_id=%s client cancelled during response write",
+                            request_id,
+                        )
+                        return
                     self._record_request_metric(endpoint_label, resp.status)
                     logger.info(
                         "request_id=%s %s %s -> %d in %.3fs",
@@ -758,7 +820,12 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", CONTENT_TYPE_LATEST)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        # L-4: Catch client-disconnect so a metrics scraper that closes
+        # the socket mid-response doesn't propagate as an uncaught error.
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_json(self, code, data):
         body = json.dumps(data).encode()
@@ -766,7 +833,13 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        # L-4: Catch client-disconnect so a closed socket doesn't crash
+        # the request handler. The `finally` in _proxy still runs and
+        # releases the in-flight counter.
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         self._proxy("GET")

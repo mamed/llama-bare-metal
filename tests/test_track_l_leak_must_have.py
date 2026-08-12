@@ -54,26 +54,29 @@ def _load_router(**env_overrides):
 
 
 # ---------------------------------------------------------------------------
-# L-1: _inflight Semaphore is dead code
+# L-1 (Phase M): the dead _inflight Semaphore placeholder has been removed.
+# These tests pin the NEW contract: no _inflight attribute exists; the
+# real tracking is _inflight_count Lock + _inflight_value[0] counter.
 # ---------------------------------------------------------------------------
 
 
 def test_inflight_semaphore_placeholder_is_dead():
-    """L-1: the module-level `_inflight = threading.Semaphore(1)` is a
-    placeholder (line 141 of llama-router.py). No code path .acquire()s or
-    .release()s it. The real in-flight tracking is the _inflight_count Lock
-    + _inflight_value[0] counter. This test pins that contract."""
+    """L-1 (Phase M): the module-level `_inflight = threading.Semaphore(1)`
+    placeholder has been REMOVED. No code path .acquire()s or .release()s
+    it (it never existed), and it cannot regress because there's nothing
+    to acquire. Real in-flight tracking is the _inflight_count Lock +
+    _inflight_value[0] counter."""
     mod = _load_router(ROUTER_API_TOKEN="t")
-    assert isinstance(mod._inflight, threading.Semaphore), "placeholder shape changed"
-    # The Semaphore's internal _value is still the initial 1.
-    # (In Python 3.11, Semaphore._cond is lazy — only created on first .acquire().)
-    assert mod._inflight._value == 1, "Semaphore value should be untouched (still 1)"
+    assert not hasattr(mod, "_inflight"), (
+        "dead placeholder _inflight Semaphore has been reintroduced — "
+        "revert llama-router.py to remove the line"
+    )
 
 
 def test_inflight_count_is_used_for_tracking():
-    """L-1 (companion): the real in-flight tracking is the _inflight_count
-    Lock + _inflight_value[0] mutable container. After many acquire/release
-    cycles, the placeholder Semaphore._value is STILL untouched."""
+    """L-1 (Phase M companion): the real in-flight tracking is the
+    _inflight_count Lock + _inflight_value[0] mutable container. After
+    many acquire/release cycles, the counter must return to 0."""
     mod = _load_router(ROUTER_API_TOKEN="t")
     mod._inflight_value[0] = 0
     for _ in range(50):
@@ -81,8 +84,6 @@ def test_inflight_count_is_used_for_tracking():
     for _ in range(50):
         mod._inflight_release()
     assert mod._inflight_value[0] == 0
-    # The Semaphore is still untouched — its _value has not changed.
-    assert mod._inflight._value == 1
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +284,7 @@ def test_proxy_handles_client_disconnect_during_response_write(tmp_path):
 
     # Provide a target model that's "valid" and a stubbed urlopen.
     with patch.object(mod, "load_available_models", return_value={"my-model": 1}):
-        with patch.object(mod, "ensure_model_loaded", lambda name: None):
+        with patch.object(mod, "ensure_model_loaded", lambda name: (True, ("ok", 0.0))):
             with patch.object(mod.request, "Request") as MockReq:
                 with patch.object(mod, "contextlib") as mock_ctx:
                     # Build a context manager whose __enter__ returns _FakeResp.

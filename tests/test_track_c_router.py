@@ -261,7 +261,7 @@ def test_do_post_proxies_to_backend(router_with_token, monkeypatch, endpoint):
         return _FakeUrlOpenResponse(body=b'{"ok":true}', status=200, headers=[("X-Upstream", "yes")])
 
     monkeypatch.setattr(router_with_token.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_with_token, "load_available_models", lambda: {"m"})
 
     body = b'{"model":"m","messages":[]}'
@@ -345,7 +345,7 @@ def test_do_post_with_bearer_auth_proxies(router_with_token, monkeypatch):
         router_with_token.request, "urlopen",
         lambda req, timeout=None: _FakeUrlOpenResponse(body=b'{"ok":1}', status=200, headers=[]),
     )
-    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_with_token, "load_available_models", lambda: {"m"})
     body = b'{"model":"m"}'
     headers = {
@@ -366,7 +366,7 @@ def test_do_post_with_x_api_token_proxies(router_with_token, monkeypatch):
         router_with_token.request, "urlopen",
         lambda req, timeout=None: _FakeUrlOpenResponse(body=b'{"ok":1}', status=200, headers=[]),
     )
-    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_with_token, "ensure_model_loaded", lambda m: (True, ("ok", 0.0)))
     monkeypatch.setattr(router_with_token, "load_available_models", lambda: {"m"})
     body = b'{"model":"m"}'
     headers = {

@@ -272,22 +272,16 @@ class RouterHandler(BaseHTTPRequestHandler):
             return None
         if length == 0:
             return b""
-        # Read the declared body. If the actual stream is longer than
-        # length (malicious or buggy peer), rfile.read(length) caps at
-        # `length` bytes — but we also peek the next byte to detect
-        # chunked-encoded or unannounced extra data and refuse it.
+        # Read the declared body. We trust Content-Length; any extra bytes
+        # the client may send past the declared length will either be
+        # consumed by the next request on a keep-alive connection or
+        # silently discarded by socket close — either way, we MUST NOT
+        # block here on a probe, because that hangs on Connection: close
+        # clients (urllib, curl, etc.) where no more data will arrive.
+        # Tradeoff: a client that streams more bytes than declared will
+        # be silently truncated to Content-Length, but the alternative
+        # was a router-wide hang on every legit request.
         body = self.rfile.read(length)
-        # Probe for trailing data without consuming it from the next request.
-        next_byte = self.rfile.read(1)
-        if next_byte:
-            self._send_json(
-                413,
-                {
-                    "error": "request body exceeds declared Content-Length",
-                    "limit_bytes": MAX_REQUEST_BYTES,
-                },
-            )
-            return None
         return body
 
     def _proxy(self, method):

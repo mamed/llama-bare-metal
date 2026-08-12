@@ -219,9 +219,18 @@ def test_request_body_size_limit(router_default, monkeypatch):
 # ===========================================================================
 
 def test_request_body_size_limit_chunked(router_default):
-    """Stream more bytes than declared Content-Length → 413."""
+    """PHASE G: Stream more bytes than declared Content-Length → silently
+    truncated to declared length. We no longer probe for trailing bytes
+    because that probe (`rfile.read(1)` after the body) hangs on
+    Connection: close requests, which is the default for urllib, curl,
+    and most clients. Tradeoff: clients that lie about Content-Length
+    no longer get a 413 — but neither does the router hang on legit
+    requests. The request proceeds with the declared-length prefix and
+    extra bytes are either consumed by the next pipelined request or
+    dropped on socket close."""
     declared = 16
-    actual = b'{"model":"x"}' + b'x' * 32  # extra bytes past declared length
+    extra = b'x' * 32  # extra bytes past declared length
+    actual = b'{"model":"x"}' + extra
     req = _FakeRequest(
         method="POST",
         path="/v1/chat/completions",
@@ -230,9 +239,13 @@ def test_request_body_size_limit_chunked(router_default):
     )
     handler = _build_handler(router_default, req)
     handler.do_POST()
-    code, payload = _read_json_response(req.wfile)
-    assert code == 413, f"expected 413 for streamed-extra-data, got {code}"
-    assert "exceeds" in payload["error"]
+    code, _payload = _read_json_response(req.wfile)
+    # We expect either 401 (auth-required, body was truncated and forwarded)
+    # or 200 (auth bypassed, body was forwarded at declared length).
+    # Either way: NOT 413 (the chunked-probe path is gone), NOT a hang.
+    assert code in (200, 401), (
+        f"expected 200/401 (silently truncated, no hang), got {code}"
+    )
 
 
 # ===========================================================================
@@ -947,3 +960,242 @@ def test_subprocess_restart_raises_when_all_paths_fail(router_default, monkeypat
 
     with pytest.raises(RuntimeError, match="(stop|start|restart)"):
         router_default.restart_with_model("dummy")
+
+
+# ===========================================================================
+# PHASE G: Connection: close / keep-alive hang regression tests.
+#
+# Before the fix: `_read_body_capped` did `self.rfile.read(1)` after
+# reading the declared body to probe for chunked-encoded trailing data.
+# On `Connection: close` requests (the default for urllib, curl, and
+# most clients) the client had already closed the socket — so `read(1)`
+# blocked until the client timed out, at which point BrokenPipe
+# occurred when the router tried to write a 413. The router hung on
+# every legit POST.
+#
+# The fix drops the probe entirely (we trust Content-Length; extra
+# bytes are silently truncated or dropped on socket close).
+#
+# These tests exercise the handler via the in-memory `_FakeRequest`
+# harness with `request_version` set to HTTP/1.0 and `Connection: close`
+# headers to verify the handler does NOT block and returns immediately.
+# ===========================================================================
+
+
+def test_router_chat_completions_with_connection_close_returns_immediately(
+    router_default, monkeypatch
+):
+    """PHASE G #1: A POST with `Connection: close` (the default for
+    urllib/curl) must return within 1s — not hang on the now-removed
+    `next_byte = self.rfile.read(1)` probe."""
+    import time
+
+    # Stub everything downstream so the test exercises ONLY the body read.
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlOpenResponse(
+            body=b'{"id":"r","choices":[]}', status=200, headers=[]
+        )
+
+    monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"x"}],"max_tokens":4}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=body,
+    )
+    req.request_version = "HTTP/1.1"  # version alone isn't the trigger
+    handler = _build_handler(router_default, req)
+
+    t0 = time.monotonic()
+    handler.do_POST()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0, (
+        f"PHASE G REGRESSION: handler took {elapsed:.3f}s — the body probe "
+        f"is hanging on Connection: close"
+    )
+    code, _payload = _read_json_response(req.wfile)
+    assert code == 200, f"expected 200 (auth ok, upstream stubbed), got {code}"
+
+
+def test_router_chat_completions_with_keep_alive_returns_immediately(
+    router_default, monkeypatch
+):
+    """PHASE G #2: HTTP/1.1 with `Connection: keep-alive` must also
+    return within 1s — the probe was wrong on every path, not just close."""
+    import time
+
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlOpenResponse(
+            body=b'{"id":"r","choices":[]}', status=200, headers=[]
+        )
+
+    monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
+
+    body = b'{"model":"m","messages":[{"role":"user","content":"x"}],"max_tokens":4}'
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "Connection": "keep-alive",
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=body,
+    )
+    handler = _build_handler(router_default, req)
+
+    t0 = time.monotonic()
+    handler.do_POST()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0, f"keep-alive handler took {elapsed:.3f}s"
+    code, _payload = _read_json_response(req.wfile)
+    assert code == 200, f"expected 200, got {code}"
+
+
+def test_router_no_hang_on_small_body(router_default, monkeypatch):
+    """PHASE G #3: Small (~200 byte) body — must respond in <1s."""
+    import time
+
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlOpenResponse(
+            body=b'{"id":"r","choices":[]}', status=200, headers=[]
+        )
+
+    monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
+
+    # Realistic small chat-completions body — well under 200 bytes.
+    body = (
+        b'{"model":"m","messages":[{"role":"user","content":"hello"}],'
+        b'"max_tokens":4}'
+    )
+
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=body,
+    )
+    handler = _build_handler(router_default, req)
+    t0 = time.monotonic()
+    handler.do_POST()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0, f"small-body handler took {elapsed:.3f}s"
+    code, _ = _read_json_response(req.wfile)
+    assert code == 200
+
+
+def test_router_no_hang_on_large_body(router_default, monkeypatch):
+    """PHASE G #4: Body declared at MAX_REQUEST_BYTES - 1 (just under the
+    32 MiB cap) must return in <2s. Since the in-memory BytesIO can't
+    actually hold 32 MiB-1, we declare large but rfile returns a small
+    body — the handler reads whatever it gets and proceeds to auth +
+    parse. The point is to assert NO HANG, regardless of status code."""
+    import time
+
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeUrlOpenResponse(
+            body=b'{"id":"r","choices":[]}', status=200, headers=[]
+        )
+
+    monkeypatch.setattr(router_default.request, "urlopen", fake_urlopen)
+
+    declared = router_default.MAX_REQUEST_BYTES - 1  # just under the cap
+    # We don't actually allocate that much; rfile just returns b"{}".
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(declared),
+            "Connection": "close",
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=b'{"model":"m"}',
+    )
+    handler = _build_handler(router_default, req)
+    t0 = time.monotonic()
+    handler.do_POST()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0, f"large-body handler took {elapsed:.3f}s"
+    # No hang regardless of downstream result; status is 200 (auth ok,
+    # upstream stubbed) since the length is under the cap.
+    code, _ = _read_json_response(req.wfile)
+    assert code == 200
+
+
+def test_router_no_hang_on_oversized_body(router_default, monkeypatch):
+    """PHASE G #5: 35 MiB declared (above the 32 MiB cap) must return
+    413 within 2s. The length pre-check rejects before any body read,
+    so this should be instant."""
+    import time
+
+    monkeypatch.setattr(router_default, "ensure_model_loaded", lambda m: None)
+    monkeypatch.setattr(router_default, "load_available_models", lambda: {"m"})
+
+    declared = 35 * 1024 * 1024
+    req = _FakeRequest(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(declared),
+            "Connection": "close",
+            "Authorization": f"Bearer {router_default.API_TOKEN}",
+        },
+        body=b"{}",
+    )
+    handler = _build_handler(router_default, req)
+    t0 = time.monotonic()
+    handler.do_POST()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0, f"oversized-body handler took {elapsed:.3f}s"
+    code, payload = _read_json_response(req.wfile)
+    assert code == 413, f"expected 413, got {code} payload={payload}"
+    assert payload["limit_bytes"] == router_default.MAX_REQUEST_BYTES
+
+
+# ===========================================================================
+# PHASE G: Unit test for the in-process body-read timeout guard. Without a
+# real socket we can't reproduce the broken-pipe path end-to-end, but we
+# CAN verify the probe is gone by inspecting the source of _read_body_capped.
+# ===========================================================================
+
+
+def test_read_body_capped_no_probe(router_default):
+    """PHASE G: The fix removes the `self.rfile.read(1)` probe entirely.
+    This test reads the source and asserts the probe byte is absent."""
+    import inspect
+    src = inspect.getsource(router_default.RouterHandler._read_body_capped)
+    assert "next_byte" not in src, (
+        "PHASE G REGRESSION: _read_body_capped still references next_byte — "
+        "the Connection: close hang fix has been undone"
+    )
+    # And the simpler path is in place.
+    assert "self.rfile.read(length)" in src, (
+        "expected plain `self.rfile.read(length)` body read in _read_body_capped"
+    )

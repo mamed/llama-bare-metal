@@ -207,6 +207,101 @@ def test_backoff_gate_rejects_swap_during_cooldown():
     assert info[1] > 0, f"backoff wait must be positive, got {info[1]}"
 
 
+def test_circuit_breaker_trips_after_threshold(monkeypatch):
+    """E2: after SWAP_CIRCUIT_TRIP_AFTER consecutive failures, the circuit
+    breaker must trip and ensure_model_loaded must short-circuit with a
+    'circuit_open' reason instead of attempting another swap. This prevents
+    the router from hammering a fundamentally broken backend indefinitely."""
+    # Set the trip threshold low (3) so the test is fast.
+    mod = _load_router(
+        ROUTER_API_TOKEN="t",
+        SWAP_CIRCUIT_TRIP_AFTER="3",
+        SWAP_CIRCUIT_OPEN_SECONDS="60",
+    )
+    mod._swap_failure_count = 0
+    mod._next_swap_allowed_at = 0.0
+    mod._circuit_open_until = 0.0
+
+    monkeypatch.setattr(mod, "write_env_file", lambda path, name: None)
+
+    class _FakeResult:
+        returncode = 1
+        stderr = "stub"
+        stdout = ""
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw: _FakeResult())
+
+    # 3 failures must trip the circuit.
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            mod.restart_with_model("failing-model")
+
+    assert mod._swap_failure_count == 3
+    assert mod._circuit_open_until > time.monotonic(), (
+        "circuit_open_until must be set in the future after trip"
+    )
+
+    # ensure_model_loaded must short-circuit with 'circuit_open'.
+    ok, info = mod.ensure_model_loaded("any-model")
+    assert ok is False
+    assert info[0] == "circuit_open", (
+        f"expected 'circuit_open', got {info[0]!r}"
+    )
+    assert info[1] > 0, f"circuit-open wait must be positive, got {info[1]}"
+
+
+def test_circuit_breaker_resets_on_success(monkeypatch):
+    """E2: a successful swap must reset the circuit breaker, not just the
+    backoff counter. Without this, the breaker would stay tripped forever
+    after a single transient failure sequence."""
+    mod = _load_router(
+        ROUTER_API_TOKEN="t",
+        SWAP_CIRCUIT_TRIP_AFTER="3",
+        SWAP_CIRCUIT_OPEN_SECONDS="60",
+    )
+    mod._swap_failure_count = 0
+    mod._next_swap_allowed_at = 0.0
+    mod._circuit_open_until = 0.0
+
+    monkeypatch.setattr(mod, "write_env_file", lambda path, name: None)
+    monkeypatch.setattr(mod, "wait_for_health", lambda timeout=120: True)
+
+    # First failed swap.
+    class _FakeResult:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stderr = ""
+            self.stdout = ""
+
+    calls = [0]
+
+    def fake_run(*a, **kw):
+        calls[0] += 1
+        return _FakeResult(1)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError):
+        mod.restart_with_model("failing-model")
+
+    assert mod._swap_failure_count == 1
+    assert mod._circuit_open_until == 0.0, (
+        "circuit must NOT trip on a single failure"
+    )
+
+    # Now make subprocess succeed.
+    def fake_run_success(*a, **kw):
+        return _FakeResult(0)
+    monkeypatch.setattr(mod.subprocess, "run", fake_run_success)
+
+    mod.restart_with_model("good-model")  # must not raise
+
+    assert mod._swap_failure_count == 0
+    assert mod._circuit_open_until == 0.0, (
+        "successful swap must reset the circuit breaker"
+    )
+
+
 def test_backoff_gate_clears_after_cooldown():
     """L-3: once the cooldown elapses, ensure_model_loaded must
     return True again (subject to the swap succeeding)."""

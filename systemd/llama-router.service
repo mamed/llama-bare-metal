@@ -12,6 +12,14 @@ WorkingDirectory=/home/fekry/Projects/llama-bare-metal
 Environment=MODELS_YAML=/home/fekry/Projects/llama-cpp-unified/models.yaml
 Environment=ENV_FILE=/home/fekry/Projects/llama-bare-metal/.env
 Environment=BACKEND_SERVICE=llama-backend.service
+Environment=ROUTER_PORT=64010
+# Bind address — sandbox only. Override to 0.0.0.0 only if you intentionally
+# expose this to LAN (and require API_TOKEN to be set).
+Environment=ROUTER_BIND=127.0.0.1
+# Disable file logging — the journal (capped at 500M, 2-week retention) is the
+# canonical store. The default RotatingFileHandler at /tmp/llama-router.log
+# would only rotate at 50 MiB and is wiped on every reboot (audit 2026-08-18).
+Environment=LOG_FILE=/dev/null
 ExecStart=/usr/bin/python3 /home/fekry/Projects/llama-bare-metal/llama-router.py
 Restart=on-failure
 RestartSec=5

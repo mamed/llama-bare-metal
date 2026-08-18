@@ -401,7 +401,7 @@ def test_prod_yaml_no_removed_keys():
     # Sample one entry per category to prove the schema works for all model families
     "google-gemma-4-12b-it-qat-q4_0",                                # google (multimodal)
     "unsloth-gemma-4-26b-a4b-it-ud-iq2-m",                           # unsloth gemma (no mmproj, big MoE)
-    "lmstudio-bonsai-27b-q1_0",                                       # lmstudio with mmproj
+    # "lmstudio-bonsai-27b-q1_0",  # model not in current models.yaml
     "unsloth-deepseek-r1-distill-qwen-32b-q2-k",                     # unsloth (medium)
     "prism-bonsai-1.7b-q1_0",                                         # prism (small)
 ])

@@ -4,7 +4,12 @@
 # - Reads MODEL_NAME from .env
 # - Sources it into the launcher's environment
 # - Writes $STATE_FILE before exec, so the router can read it
-# - Removes $STATE_FILE on exit (any signal)
+# - The state file is REMOVED on backend shutdown by the systemd unit's
+#   `ExecStop=rm -f %t/llama-backend.model` (line 40 of llama-backend.service).
+#   This is the authoritative cleanup path. The trap below is dead code
+#   because `exec launcher.sh` at the end of this script replaces the
+#   process — the trap is gone the moment exec runs. Kept for safety
+#   in case future changes remove the `exec` (audit 2026-08-18).
 set -euo pipefail
 
 # D2: Structured logging — emit to stderr with timestamps so the systemd
@@ -36,7 +41,11 @@ fi
 # immediately on first request after backend start
 echo "$MODEL_NAME" > "$STATE_FILE"
 
-# Clean up state file on any exit (SIGTERM from systemctl, etc.)
+# DEAD CODE (audit 2026-08-18): the cleanup() trap below never runs in
+# production because we `exec` into launcher.sh. The authoritative cleanup
+# is the systemd unit's `ExecStop=rm -f %t/llama-backend.model`. Kept here
+# as a safety net for the unlikely case that this script is invoked
+# directly without `exec` (e.g. `bash llama-backend.sh` from a debug shell).
 cleanup() {
     rm -f "$STATE_FILE"
 }

@@ -687,5 +687,12 @@ def test_main_smoke_test(router_with_token, monkeypatch, capsys):
     assert "env file:" in out
     assert "known models:" in out
     assert "API token" in out
-    # The token we configured must be in the banner so operators can copy it.
-    assert router_with_token.API_TOKEN in out
+    # Security (audit 2026-08-18): the token is REDACTED in the log line —
+    # only a fingerprint (first 4 + ... + last 4) is emitted. The full token
+    # is NOT in the log. Operators verify the token is set by comparing
+    # the fingerprint against their secrets manager.
+    fp = f"{router_with_token.API_TOKEN[:4]}...{router_with_token.API_TOKEN[-4:]}"
+    assert fp in out, f"expected fingerprint {fp!r} in log output"
+    assert router_with_token.API_TOKEN not in out, (
+        "security regression: full API token leaked into log output"
+    )

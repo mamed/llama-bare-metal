@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -42,10 +43,6 @@ def build_args(
     if not Path(model_path).is_file():
         raise FileNotFoundError(model_path)
     args = ["-m", model_path, "--host", "0.0.0.0" if host is None else str(host), "--port", "64000" if port is None else str(port)]
-    numeric = (("gpu_layers", "-ngl"), ("context_size", "--ctx-size"), ("threads", "--threads"), ("ubatch_size", "--ubatch-size"), ("parallel", "--parallel"))
-    for key, flag in numeric:
-        if entry.get(key) is not None and entry.get(key) != "":
-            args.extend([flag, str(entry[key])])
     for key, flag in (("ctk", "-ctk"), ("ctv", "-ctv")):
         if entry.get(key):
             args.extend([flag, str(entry[key])])
@@ -73,15 +70,22 @@ def build_args(
     if extra_args:
         args.extend(extra_args)
 
-    # ----- Server-level defaults (apply to every model unless overridden) -----
-    # Per-model yaml can no longer set these (per-model handlers removed).
-    # Disable per-launch via env var.
-    import os as _os
-    if _os.environ.get("DISABLE_REASONING") != "true":
+    # Env vars override YAML for gpu_layers and context_size; all others from YAML
+    env_ngl = os.environ.get("GPU_LAYERS")
+    env_ctx = os.environ.get("CTX_SIZE")
+    numeric = (("gpu_layers", "-ngl"), ("context_size", "--ctx-size"), ("threads", "--threads"), ("ubatch_size", "--ubatch-size"), ("parallel", "--parallel"))
+    for key, flag in numeric:
+        if key == "gpu_layers" and env_ngl is not None:
+            args.extend([flag, env_ngl])
+        elif key == "context_size" and env_ctx is not None:
+            args.extend([flag, env_ctx])
+        elif entry.get(key) is not None and entry.get(key) != "":
+            args.extend([flag, str(entry[key])])
+    if os.environ.get("DISABLE_REASONING") != "true":
         args.extend(["--reasoning", "on", "--reasoning-budget", "32768"])
-    if _os.environ.get("DISABLE_AGENT") != "true":
+    if os.environ.get("DISABLE_AGENT") != "true":
         args.append("--agent")
-    if _os.environ.get("DISABLE_JINJA") != "true":
+    if os.environ.get("DISABLE_JINJA") != "true":
         args.append("--jinja")
 
     return args

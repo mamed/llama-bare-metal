@@ -1,0 +1,32 @@
+[Unit]
+Description=llama.cpp backend watchdog pinger
+# Watch the backend unit's state. When the backend dies, the watcher dies.
+# When the backend is starting, the watcher waits for it (After=).
+After=llama-backend.service
+Wants=llama-backend.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/fekry/Projects/llama-bare-metal
+Environment=HEALTH_URL=http://127.0.0.1:64000/health
+Environment=PING_INTERVAL=10
+Environment=HEALTH_TIMEOUT=3
+# BACKEND_SERVICE: which unit to restart when /health fails.
+# Set explicitly so the script's default isn't the source of truth
+# (audit 2026-08-18). Change this if you rename the backend unit.
+Environment=BACKEND_SERVICE=llama-backend.service
+ExecStart=/home/fekry/Projects/llama-bare-metal/llama-backend-watcher.sh
+Restart=on-failure
+RestartSec=5
+# The watcher itself doesn't have a watchdog. Instead, when its /health
+# probe fails for FAIL_THRESHOLD consecutive checks, it triggers a
+# `systemctl restart llama-backend.service` (L-3 backoff + E2 circuit
+# breaker in the router will throttle repeat restarts).
+# No NotifyAccess needed — the watcher never calls systemd-notify.
+# (audit 2026-08-18) Add STARTUP_GRACE_SEC environment override here
+# if you need to tune the grace window from the unit file.
+
+[Install]
+WantedBy=default.target

@@ -2,6 +2,10 @@
 Description=llama.cpp backend (one model at a time, MODEL from /home/fekry/llama-bare-metal/.env)
 After=network-online.target
 Wants=network-online.target
+# Hard dependency on the model directory (symlink to /run/media/fekry/OS-Shared).
+# If the mount didn't come up at boot, fail the unit instead of starting in
+# router mode with no preset (the 2026-08-18 outage).
+RequiresMountsFor=/home/fekry/llama-models
 # E4: Rate-limit restart attempts (must be in [Unit], not [Service]).
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -11,20 +15,35 @@ Type=simple
 WorkingDirectory=/home/fekry/Projects/llama-bare-metal
 Environment=CONFIG_FILE=/home/fekry/Projects/llama-cpp-unified/models.yaml
 Environment=MODELS_DIR=/home/fekry/llama-models/LLM-Models
+# Per-model gpu_layers comes from models.yaml (yaml gpu_layers:40 for Q4_K_XL, gpu_layers:99 for IQ2_M).
+# This systemd env is intentionally NOT set (= unset) so per-model YAML gpu_layers wins.
+# Hardware ceiling rationale: Muse IQ2_M (12.3 GB) fits at ngl=99; Muse Q4_K_XL (15.9 GB)
+# fits only at ngl=40 on 12 GB VRAM (12 layers on CPU).
+# Environment=GPU_LAYERS=99
+# CTX_SIZE removed — per-model ctx comes from models.yaml context_size field
+Environment=DISABLE_REASONING=false
+Environment=DISABLE_AGENT=false
+Environment=DISABLE_JINJA=false
+# DISABLE_KV_UNIFIED=true: skip --kv-unified (lazy KV allocation). Required for
+# 1M ctx where unified pre-allocation OOMs. Default for Qwen3-Coder-1M models.
+Environment=DISABLE_KV_UNIFIED=true
+# Bind address — sandbox only. Override to 0.0.0.0 only if you intentionally
+# expose this to LAN (and require API_TOKEN to be set on the router).
+Environment=HOST=127.0.0.1
 # Pin to the 3D V-Cache CCD (cores 0-7 = 96 MB L3 vs cores 8-15 = 32 MB L3).
 # KV cache streaming benefits from lower L3 latency.
 ExecStartPre=/bin/mkdir -p /tmp/llama-slots
 ExecStart=/usr/bin/taskset -c 0-7 /home/fekry/Projects/llama-bare-metal/llama-backend.sh
+# Watchdog handled by sibling unit llama-backend-watcher.service.
+# Allow the watcher to send WATCHDOG=1 on the unit's notify socket.
+# Without this, systemd-notify returns EPERM and the watcher can't ping.
 ExecStop=/bin/rm -f %t/llama-backend.model
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=300
-# E2: Watchdog — if llama-server hasn't sent a watchdog keepalive within
-# 300 seconds, systemd SIGKILLs the unit. llama-server doesn't natively
-# ping the watchdog, so this is a backstop for catastrophic hangs.
-# Set WATCHDOG_USEC=1 in the environment to enable.
-# (Correct directive: WatchdogSec= in [Service])
-WatchdogSec=300
+TimeoutStopSec=30
+# Watchdog is handled by the sibling unit llama-backend-watcher.service.
+# When the backend hangs (/health fails), the watcher detects it and
+# explicitly triggers `systemctl restart llama-backend.service`.
 
 # NVIDIA — make GPU visible. Same shape the Docker container used.
 Environment=NVIDIA_VISIBLE_DEVICES=all

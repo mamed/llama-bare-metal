@@ -11,7 +11,7 @@
 #   MODEL_NAME    — the YAML entry's `name:` field
 # Optional env (override YAML values):
 #   PORT          — port to bind (default: 64000)
-#   HOST          — bind address (default: 0.0.0.0)
+#   HOST          — bind address (default: 127.0.0.1)
 # Anything else is taken from the YAML.
 
 set -eo pipefail
@@ -76,7 +76,7 @@ if [[ "${DISABLE_GPU_CHECK:-}" != "true" ]]; then
 fi
 
 PORT="${PORT:-64000}"
-HOST="${HOST:-0.0.0.0}"
+HOST="${HOST:-127.0.0.1}"
 
 # Build the llama-server argv list using the tested Python module.
 # The module is the single source of truth for the YAML→flag mapping
@@ -165,6 +165,14 @@ trap 'rm -f "$EXTRA_ARGS_FILE"' EXIT
 printf '%s\n' "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" > "$EXTRA_ARGS_FILE"
 
 read_args() {
+    # Capture the python exit code on its own stderr line so the caller can
+    # detect build_args failures. The previous shape `mapfile -t ARGS < <(read_args)`
+    # silently swallowed the python child's exit code (mapfile's exit status
+    # is 0 even when the process-substitution wrote no lines because the
+    # python script raised). Failure of build_args used to fall through to
+    # `exec llama-server "${ARGS[@]}"` with an empty ARGS array, which
+    # caused llama-server to start in router mode with no preset — exactly
+    # the broken state we hit on 2026-08-18.
     PYTHONPATH="$LLAMA_BARE_SRC" python3 -c '
 import sys
 from llama_bare.launcher_config import build_args
@@ -173,15 +181,34 @@ args = build_args(sys.argv[2], sys.argv[3], host=sys.argv[4], port=sys.argv[5], 
 for a in args:
     print(a)
 ' "$EXTRA_ARGS_FILE" "$CONFIG" "$MODEL_NAME" "$HOST" "$PORT"
+    PY_RC=$?
+    echo "PYTHON_EXIT_CODE=$PY_RC" >&2
+    return "$PY_RC"
 }
 
-# Capture into an array
-mapfile -t ARGS < <(read_args)
-RC=$?
+# Capture the python exit code on stderr (via the PYTHON_EXIT_CODE marker
+# emitted by read_args) so build_args failures actually halt the script.
+# The previous shape `mapfile -t ARGS < <(read_args)` silently swallowed
+# the python child's exit code (mapfile's exit status is 0 even when the
+# process-substitution wrote no lines because the python script raised).
+# Failure of build_args used to fall through to `exec llama-server` with
+# an empty ARGS array, which caused llama-server to start in router mode
+# with no preset — exactly the broken state we hit on 2026-08-18.
+RC_FILE="$(mktemp)"
+trap 'rm -f "$EXTRA_ARGS_FILE" "$RC_FILE"' EXIT
 
-if [[ $RC -ne 0 ]]; then
-    log_error "FATAL: build_args failed (exit $RC)"
-    exit "$RC"
+if ! ARGS_OUTPUT="$(read_args 2>"$RC_FILE")"; then
+    PY_RC=$(grep -oE 'PYTHON_EXIT_CODE=[0-9]+' "$RC_FILE" | tail -1 | cut -d= -f2)
+    PY_RC="${PY_RC:-1}"
+    log_error "FATAL: build_args failed (python exit $PY_RC)"
+    cat "$RC_FILE" >&2
+    exit "$PY_RC"
+fi
+
+mapfile -t ARGS <<< "$ARGS_OUTPUT"
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+    log_error "FATAL: build_args returned no arguments"
+    exit 1
 fi
 
 log_info "--- launcher: loaded config for MODEL_NAME=$MODEL_NAME ---"

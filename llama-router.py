@@ -71,6 +71,9 @@ BACKEND_STATE_FILE = os.environ.get(
 )
 BACKEND_SERVICE = os.environ.get("BACKEND_SERVICE", "llama-backend.service")
 ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "64010"))
+# Bind address. Default 127.0.0.1 (= sandbox only). Set ROUTER_BIND=0.0.0.0
+# if you intentionally expose this to LAN (and require API_TOKEN to be set).
+ROUTER_BIND = os.environ.get("ROUTER_BIND", "127.0.0.1")
 
 # ---- Security knobs (A1, A3) ----
 # A1: Cap incoming request bodies. 32 MiB matches typical chat-completions
@@ -151,6 +154,16 @@ SWAP_BACKOFF_MAX = 60.0  # ceiling
 _swap_failure_count = 0
 _next_swap_allowed_at = 0.0  # time.monotonic() when next swap is allowed
 _swap_backoff_lock = threading.Lock()
+
+# ---- E2: Circuit breaker on repeated swap failures ----
+# After SWAP_CIRCUIT_TRIP_AFTER consecutive failures, refuse to swap for
+# SWAP_CIRCUIT_OPEN_SECONDS and log a CRITICAL message. This prevents the
+# router from repeatedly hammering a fundamentally broken backend (e.g.
+# /etc/fstab UUID pointing to a missing drive, the 2026-08-18 outage)
+# while still allowing recovery if the operator fixes the underlying issue.
+SWAP_CIRCUIT_TRIP_AFTER = int(os.environ.get("SWAP_CIRCUIT_TRIP_AFTER", "10"))
+SWAP_CIRCUIT_OPEN_SECONDS = int(os.environ.get("SWAP_CIRCUIT_OPEN_SECONDS", "300"))
+_circuit_open_until = 0.0  # time.monotonic() when the circuit re-closes
 
 
 def _inflight_acquire():
@@ -355,7 +368,7 @@ def restart_with_model(model_name):
     a hung unit), fall back to stop+start which always returns promptly.
     L-3: On success, reset the swap-backoff counter. On failure, increment
     the counter and push the next-allowed time forward exponentially."""
-    global _swap_failure_count, _next_swap_allowed_at
+    global _swap_failure_count, _next_swap_allowed_at, _circuit_open_until
     swap_start = time.monotonic()
     # Drop a hint that we're about to swap so the backend startup logs
     # make sense alongside our own log line. Uses the tested writer so the
@@ -426,9 +439,12 @@ def restart_with_model(model_name):
             METRICS_LOADED_AT.set(time.time())
             METRICS_LOADED_MODEL.labels(model_name=model_name).set(1)
         # L-3: Success — reset backoff state.
+        # E2: Also reset the circuit breaker; a successful swap proves
+        # the backend is healthy enough to trust again.
         with _swap_backoff_lock:
             _swap_failure_count = 0
             _next_swap_allowed_at = 0.0
+            _circuit_open_until = 0.0
     except Exception:
         if METRICS_SWAPS_TOTAL is not None and status == "success":
             METRICS_SWAPS_TOTAL.labels(model_name=model_name, status="failed").inc()
@@ -447,6 +463,20 @@ def restart_with_model(model_name):
             "swap failure #%d for MODEL=%s; next swap allowed in %.1fs",
             _swap_failure_count, model_name, backoff,
         )
+        # E2: Trip the circuit breaker after SWAP_CIRCUIT_TRIP_AFTER
+        # consecutive failures. After that, ensure_model_loaded will
+        # refuse new swaps for SWAP_CIRCUIT_OPEN_SECONDS and the proxy
+        # will return 503 + Retry-After instead of hammering a broken
+        # backend (the 2026-08-18 outage pattern).
+        if _swap_failure_count >= SWAP_CIRCUIT_TRIP_AFTER:
+            with _swap_backoff_lock:
+                _circuit_open_until = time.monotonic() + SWAP_CIRCUIT_OPEN_SECONDS
+            logger.critical(
+                "swap circuit breaker TRIPPED after %d failures; "
+                "refusing swaps for %ds until %s. Investigate backend.",
+                _swap_failure_count, SWAP_CIRCUIT_OPEN_SECONDS,
+                time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(_circuit_open_until)),
+            )
         raise
 
 
@@ -459,6 +489,16 @@ def ensure_model_loaded(model_name):
     restart_lock (which would either cut an in-flight stream or queue
     behind another swap)."""
     global current_model, _swap_in_progress
+    # E2: Circuit breaker gate. Checked first because a tripped breaker
+    # means the operator should investigate, not the auto-retry loop.
+    with _swap_backoff_lock:
+        circuit_wait = _circuit_open_until - time.monotonic()
+    if circuit_wait > 0:
+        logger.warning(
+            "swap to %r rejected: circuit breaker OPEN for %.1fs after %d consecutive failures",
+            model_name, circuit_wait, _swap_failure_count,
+        )
+        return False, ("circuit_open", circuit_wait)
     # L-3: Backoff gate. Checked BEFORE acquiring restart_lock so a request
     # rejected by backoff doesn't block other swappers behind it.
     with _swap_backoff_lock:
@@ -992,13 +1032,21 @@ def main():
     logger.info("env file: %s", ENV_FILE)
     logger.info("known models: %d", len(load_available_models()))
     logger.info("max request bytes: %d (%d MiB)", MAX_REQUEST_BYTES, MAX_REQUEST_BYTES // (1024*1024))
-    # A3: Log the API token exactly once at startup. If the operator didn't
-    # set $ROUTER_API_TOKEN, the auto-generated token is the only way in.
+    # A3: Log a FINGERPRINT of the API token exactly once at startup — never
+    # the full token. The fingerprint is the first 4 + "..." + last 4 chars
+    # plus the length, so the operator can verify the token is set (and
+    # compare against their secrets manager) without leaking the secret to
+    # the systemd journal (which is world-readable by default on multi-user
+    # boxes and persists for the journald retention window).
     token_source = "env" if os.environ.get("ROUTER_API_TOKEN") else "auto-generated"
-    # The token is printed in full. Note: if sourced from env, this means
-    # the secret lands in the systemd journal; consider setting ROUTER_API_TOKEN
-    # via a file-based unit's EnvironmentFile= to keep it out of journalctl.
-    logger.info("API token (%s): %s", token_source, API_TOKEN)
+    if len(API_TOKEN) >= 9:
+        fingerprint = f"{API_TOKEN[:4]}...{API_TOKEN[-4:]}"
+    else:
+        fingerprint = "(short)"
+    logger.info(
+        "API token loaded (source=%s, fingerprint=%s, length=%d)",
+        token_source, fingerprint, len(API_TOKEN),
+    )
 
     # Show what llama-backend currently has
     loaded = read_current_model_from_backend()
@@ -1011,7 +1059,7 @@ def main():
     health_thread = threading.Thread(target=_background_health_loop, daemon=True, name="router-health")
     health_thread.start()
 
-    server = ThreadingHTTPServer(("0.0.0.0", ROUTER_PORT), RouterHandler)
+    server = ThreadingHTTPServer((ROUTER_BIND, ROUTER_PORT), RouterHandler)
     server.request_queue_size = 128  # E3: cap concurrent connections
 
     # H1: SIGTERM handler — drain in-flight requests, then exit. systemd

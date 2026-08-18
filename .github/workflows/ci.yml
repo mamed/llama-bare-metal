@@ -36,7 +36,8 @@ jobs:
 
       - name: Lint bash scripts
         run: |
-          shellcheck launcher.sh llama-backend.sh scripts/find_max_ctx.sh
+          # Mirror tests/test_bash_scripts.py — keep this list in sync.
+          shellcheck launcher.sh llama-backend.sh llama-backend-watcher.sh restore-systemd.sh scripts/find_max_ctx.sh
           # The test suite also runs shellcheck+bash -n on the same set of
           # scripts via tests/test_bash_scripts.py — this is a belt-and-
           # braces check so a CI failure shows up even if the test runner

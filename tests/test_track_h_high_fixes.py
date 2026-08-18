@@ -269,17 +269,18 @@ def test_router_systemd_unit_uses_correct_models_yaml():
     )
 
 
-def test_root_router_service_matches_systemd_copy():
-    """I-2: the root-level llama-router.service must match the systemd/ copy."""
-    root_copy = (REPO_ROOT / "llama-router.service").read_text()
-    systemd_copy = (REPO_ROOT / "systemd" / "llama-router.service").read_text()
-    root_match = re.search(r"Environment=MODELS_YAML=(\S+)", root_copy)
-    systemd_match = re.search(r"Environment=MODELS_YAML=(\S+)", systemd_copy)
-    assert root_match, "root llama-router.service missing MODELS_YAML"
-    assert systemd_match, "systemd/llama-router.service missing MODELS_YAML"
-    assert root_match.group(1) == systemd_match.group(1), (
-        f"root copy points at {root_match.group(1)!r} but systemd copy points at "
-        f"{systemd_match.group(1)!r}"
+def test_no_root_level_service_file():
+    """I-2: there must be no top-level llama-router.service. Otherwise a
+    fresh clone where someone `cp llama-router.service ~/.config/systemd/user/`
+    would deploy the UNHARDENED version (audit 2026-08-18). The canonical
+    location is systemd/llama-router.service; the watcher and backend
+    units also live in systemd/. Always install via restore-systemd.sh.
+    """
+    root_path = REPO_ROOT / "llama-router.service"
+    assert not root_path.exists(), (
+        f"{root_path.name} is present at the repo root. The hardened version "
+        f"lives in systemd/. Delete this file or people will deploy the "
+        f"unhardened version by mistake. See audit 2026-08-18 finding F."
     )
 
 

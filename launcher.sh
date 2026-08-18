@@ -215,4 +215,9 @@ log_info "--- launcher: loaded config for MODEL_NAME=$MODEL_NAME ---"
 printf '  %s\n' "${ARGS[@]}" >&2
 
 log_info "--- launcher: exec llama-server ---"
+# Clean up tmpfiles BEFORE exec. Trap-based cleanup does not fire here
+# because exec replaces the bash process (the EXIT trap is per-process).
+# Without this, every backend restart leaves an EXTRA_ARGS_FILE and
+# RC_FILE in /tmp (audit 2026-08-18 finding FFF).
+rm -f "$EXTRA_ARGS_FILE" "$RC_FILE"
 exec "$LLAMA_SERVER_BIN" "${ARGS[@]}"
